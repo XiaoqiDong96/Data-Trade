@@ -1,0 +1,43 @@
+# Data are intentionally excluded from the GitHub repository.
+data/
+data_merged/
+raw/
+handoff/
+tmp/
+logs/
+
+# Common data and large generated artifacts
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.dta
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.json
+*.jsonl
+*.html
+*.log
+
+# Literature PDFs are not redistributed in this repository.
+literature/**/*.pdf
+pdfs/
+pdfs_quarantine/
+
+# Python / OS
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Stata
+*.smcl
+*.gph
