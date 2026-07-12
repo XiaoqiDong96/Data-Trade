@@ -189,3 +189,38 @@ python3 rapidapi_crawl/scripts/build_static_enriched_panel.py --root rapidapi_cr
 - Plan-to-endpoint scope:
   `rapidapi_static_Data_billing_item_endpoints.csv` connected to
   `billing_limits.billingitem_id`
+
+## External Research Enrichment
+
+The external pipeline adds public, non-RapidAPI evidence in identification
+priority order:
+
+1. exact API-host mentions in public GitHub repositories indexed by Sourcegraph;
+2. candidate substitutes from Data.gov and the European Data Portal;
+3. within-market endpoint and response-schema overlap;
+4. competing products and public prices from other API marketplaces;
+5. owner websites, RDAP domain records, Common Crawl presence, and GLEIF matches;
+6. OECD Digital STRI, World Bank digital indicators, and public AWS API costs.
+
+Run the complete resumable pipeline in the foreground:
+
+```bash
+bash rapidapi_crawl/scripts/run_external_research_enrichment.sh
+```
+
+Start it in a detached `screen` session with automatic retries:
+
+```bash
+bash rapidapi_crawl/scripts/start_external_research_background.sh
+```
+
+Raw responses are stored by source under `rapidapi_crawl/external_raw/` and
+normalized research tables under `rapidapi_crawl/data_external/`. Both paths
+are excluded from Git because they contain research data and machine-generated
+outputs. Every normalized source includes a fetch timestamp, source URL, merge
+key, and match score where matching is probabilistic.
+
+Actual endpoint response sampling is optional. Set `RAPIDAPI_KEY` to sample at
+most one parameter-free GET endpoint from each API with a free plan. The code
+stores only field paths, sizes, status codes, and hashed scalar fingerprints;
+it never stores response bodies or the API key.

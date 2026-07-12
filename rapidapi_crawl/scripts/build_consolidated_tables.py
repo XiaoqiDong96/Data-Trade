@@ -23,9 +23,12 @@ csv.field_size_limit(sys.maxsize)
 
 
 def read_csv(path: Path, usecols: list[str] | None = None) -> pd.DataFrame:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
-    return pd.read_csv(path, dtype=str, low_memory=False, usecols=usecols)
+    try:
+        return pd.read_csv(path, dtype=str, low_memory=False, usecols=usecols)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def to_num(s: pd.Series) -> pd.Series:

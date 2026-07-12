@@ -1,6 +1,10 @@
 # Data are intentionally excluded from the GitHub repository.
 data/
 data_merged/
+data_incremental/
+data_external/
+external_raw/
+weekly_runs/
 raw/
 handoff/
 tmp/
