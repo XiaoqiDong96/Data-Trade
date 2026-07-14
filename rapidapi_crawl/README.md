@@ -214,6 +214,13 @@ Start it in a detached `screen` session with automatic retries:
 bash rapidapi_crawl/scripts/start_external_research_background.sh
 ```
 
+The scheduled weekly updater calls
+`build_external_incremental_enrichment.py` after constructing each RapidAPI
+delta. It processes only the new API ids in that run, reuses existing external
+raw caches, and writes its outputs under
+`data_incremental/<run_id>/external_incremental/`. Historical external tables
+and the baseline merged tables are not overwritten.
+
 Raw responses are stored by source under `rapidapi_crawl/external_raw/` and
 normalized research tables under `rapidapi_crawl/data_external/`. Both paths
 are excluded from Git because they contain research data and machine-generated

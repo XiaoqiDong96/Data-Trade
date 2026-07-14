@@ -29,6 +29,8 @@ EXPOSURE_WORKERS="${EXPOSURE_WORKERS:-2}"
 EXPOSURE_DELAY="${EXPOSURE_DELAY:-1.00}"
 EXPOSURE_TERMS_MODE="${EXPOSURE_TERMS_MODE:-broad}"
 EXPOSURE_MAX_PAGES="${EXPOSURE_MAX_PAGES:-10}"
+EXTERNAL_WORKERS="${EXTERNAL_WORKERS:-2}"
+EXTERNAL_DELAY="${EXTERNAL_DELAY:-0.75}"
 
 mkdir -p "$LOG_DIR" "$WORK_ROOT/data" "$OUT_DIR"
 exec >> "$LOG_FILE" 2>&1
@@ -204,6 +206,14 @@ run "build_aligned_delta_tables" \
   --history-dir rapidapi_crawl/data_incremental \
   --out-dir "$OUT_DIR" \
   --run-id "$RUN_ID"
+
+run "external_enrichment_for_new_apis" \
+  "$PY" rapidapi_crawl/scripts/build_external_incremental_enrichment.py \
+  --root rapidapi_crawl \
+  --run-dir "$OUT_DIR" \
+  --run-id "$RUN_ID" \
+  --workers "$EXTERNAL_WORKERS" \
+  --delay "$EXTERNAL_DELAY"
 
 rm -rf "$WORK_ROOT"
 status "complete" "complete" "weekly incremental delta tables written to $OUT_DIR"

@@ -1050,6 +1050,17 @@ def stage_macro(root: Path, retry_errors: bool) -> None:
             })
     save_csv(out / "world_bank_digital_macro.csv", wb_rows)
 
+    country_url = "https://api.worldbank.org/v2/country"
+    country_body = request("GET", country_url, params={"format": "json", "per_page": 400}, timeout=90).json()
+    country_rows = []
+    for item in (country_body[1] if isinstance(country_body, list) and len(country_body) > 1 else []):
+        country_rows.append({
+            "country_iso2": item.get("iso2Code"), "country_iso3": item.get("id"),
+            "country_name": item.get("name"), "region": (item.get("region") or {}).get("value"),
+            "income_level": (item.get("incomeLevel") or {}).get("value"), "source_url": country_url,
+        })
+    save_csv(out / "world_bank_country_codes.csv", country_rows)
+
     cloud_rows = []
     for service, url in AWS_PRICE_URLS.items():
         path = raw / f"aws_{service}.json"
@@ -1113,14 +1124,32 @@ def stage_build(root: Path) -> None:
         panel["owner_country"] = panel["lei_country"].where(confidence.eq(1), fallback)
     elif "tld_country" in panel: panel["owner_country"] = panel["tld_country"]
 
+    country_path = out / "world_bank_country_codes.csv"
+    if country_path.exists() and "owner_country" in panel:
+        countries = read_csv_optional(country_path)
+        if not countries.empty:
+            crosswalk = countries.dropna(subset=["country_iso2", "country_iso3"]).drop_duplicates("country_iso2").set_index("country_iso2")["country_iso3"]
+            owner_country = panel["owner_country"].fillna("").astype(str).str.upper()
+            panel["owner_country_iso3"] = owner_country.where(owner_country.str.len().eq(3), owner_country.map(crosswalk))
+
     dstri_path = out / "oecd_digital_stri.csv"
-    if dstri_path.exists() and "owner_country" in panel:
+    if dstri_path.exists() and "owner_country_iso3" in panel:
         dstri = pd.read_csv(dstri_path, low_memory=False)
         dstri = dstri[dstri["MEASURE"].eq("STRI")].sort_values("TIME_PERIOD").drop_duplicates("REF_AREA", keep="last")
-        dstri = dstri[["REF_AREA", "TIME_PERIOD", "OBS_VALUE"]].rename(columns={"REF_AREA": "owner_country", "TIME_PERIOD": "dstri_year", "OBS_VALUE": "digital_stri"})
-        panel["owner_country"] = panel["owner_country"].fillna("").astype(str)
-        dstri["owner_country"] = dstri["owner_country"].fillna("").astype(str)
-        panel = panel.merge(dstri, on="owner_country", how="left")
+        dstri = dstri[["REF_AREA", "TIME_PERIOD", "OBS_VALUE"]].rename(columns={"REF_AREA": "owner_country_iso3", "TIME_PERIOD": "dstri_year", "OBS_VALUE": "digital_stri"})
+        panel["owner_country_iso3"] = panel["owner_country_iso3"].fillna("").astype(str)
+        dstri["owner_country_iso3"] = dstri["owner_country_iso3"].fillna("").astype(str)
+        panel = panel.merge(dstri, on="owner_country_iso3", how="left")
+
+    wb_path = out / "world_bank_digital_macro.csv"
+    if wb_path.exists() and "owner_country_iso3" in panel:
+        wb = read_csv_optional(wb_path)
+        if not wb.empty:
+            wb["year_num"] = pd.to_numeric(wb["year"], errors="coerce")
+            wb["value_num"] = pd.to_numeric(wb["value"], errors="coerce")
+            latest = wb.dropna(subset=["country_iso3", "indicator_name", "value_num"]).sort_values("year_num").drop_duplicates(["country_iso3", "indicator_name"], keep="last")
+            latest = latest.pivot(index="country_iso3", columns="indicator_name", values="value_num").reset_index().rename(columns={"country_iso3": "owner_country_iso3"})
+            panel = panel.merge(latest, on="owner_country_iso3", how="left")
     panel.to_csv(out / "rapidapi_external_enriched_panel.csv", index=False)
 
     coverage = []
@@ -1132,6 +1161,7 @@ def stage_build(root: Path) -> None:
         "competitor_best_match_score": "cross-platform product match",
         "domain": "owner registrable web domain",
         "owner_country": "high-confidence LEI country or country-code TLD",
+        "owner_country_iso3": "ISO alpha-3 owner country used for international merges",
         "digital_stri": "latest OECD Digital STRI score",
     }
     for variable, meaning in variables.items():
