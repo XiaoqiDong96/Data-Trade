@@ -2,6 +2,25 @@
 
 Public-only RapidAPI marketplace crawl for the `Data` category.
 
+## Safe Local Test
+
+Start with an offline normalization run to verify the environment without
+making network requests:
+
+```bash
+python3 rapidapi_crawl/scripts/rapidapi_crawler.py \
+  --category Data \
+  --skip-search \
+  --details \
+  --details-source discovery \
+  --details-limit 0 \
+  --details-offline-only
+```
+
+Generated raw responses, incremental datasets, reports, and logs are local
+artifacts and are intentionally excluded from publication. Use synthetic
+fixtures when adding automated tests.
+
 ## Current Snapshot
 
 - Crawl date: 2026-06-14
