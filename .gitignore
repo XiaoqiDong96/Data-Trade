@@ -9,6 +9,7 @@ raw/
 handoff/
 tmp/
 logs/
+rapidapi_io_static/full_results/
 
 # Common data and large generated artifacts
 *.csv

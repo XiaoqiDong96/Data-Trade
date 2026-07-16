@@ -1,0 +1,7 @@
+pandas>=2.0,<3
+numpy>=1.26,<2
+scipy>=1.10,<2
+statsmodels>=0.14,<1
+matplotlib>=3.8,<4
+pyblp>=1.2,<2
+linearmodels>=6,<8
