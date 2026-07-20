@@ -118,8 +118,8 @@ TABLE_META = {
 
 DIRECT_MEANINGS = {
     "api_id": "RapidAPI API 产品唯一标识，是 API 层表的主键和跨表合并键。",
-    "plan_id": "价格计划唯一标识；与 api_id、version_id 联合识别计划版本。",
-    "version_id": "API 或价格计划版本标识。",
+    "plan_id": "价格计划唯一标识；通常与 api_id、version_id 联合识别计划版本。",
+    "version_id": "API 或价格计划版本标识；平台对极少数计划不返回该字段，此时以 api_id + plan_id 稳定识别。",
     "endpoint_id": "API endpoint 唯一标识。",
     "owner_id": "API 提供者或组织唯一标识。",
     "query_id": "搜索查询单元唯一标识。",
@@ -262,6 +262,23 @@ def write_handoff(paths: list[Path]) -> Path:
     path_by_name = {path.name: path for path in paths}
     master = pd.read_csv(path_by_name["rapidapi_merged_api_master.csv"], usecols=["api_id"])
     master_ids = set(master["api_id"].dropna().astype(str))
+    plans = pd.read_csv(
+        path_by_name["rapidapi_merged_plan_contracts.csv"],
+        usecols=["api_id", "plan_id", "version_id"],
+        low_memory=False,
+    )
+    missing_plan_version = (
+        plans["version_id"].isna()
+        | plans["version_id"].astype("string").str.strip().eq("")
+    )
+    missing_plan_version_count = int(missing_plan_version.sum())
+    missing_plan_version_duplicates = int(
+        plans.loc[missing_plan_version].duplicated(["api_id", "plan_id"], keep=False).sum()
+    )
+    missing_plan_version_note = (
+        f"平台对 {missing_plan_version_count:,} 行计划未返回可选的 `version_id`，"
+        f"这部分以 `api_id + plan_id` 稳定识别；备用键重复 {missing_plan_version_duplicates:,} 行。"
+    )
 
     def api_coverage(path: Path) -> tuple[int, int]:
         header = read_header(path)
@@ -318,7 +335,7 @@ def write_handoff(paths: list[Path]) -> Path:
             "## 合并关系",
             "",
             "- API 层表以 `api_id` 一对一合并。",
-            "- 计划表以 `api_id` 多对一连接 API 主表；计划唯一键为 `api_id + plan_id + version_id`。",
+            f"- 计划表以 `api_id` 多对一连接 API 主表；常规唯一键为 `api_id + plan_id + version_id`。{missing_plan_version_note}",
             "- endpoint 表以 `api_id` 多对一连接主表；endpoint 唯一键为 `api_id + endpoint_id`。",
             "- 搜索表以 `api_id` 多对一连接主表；固定效应单元由查询词与排序方式共同定义。",
             "- schema 产品对分别用 `api_id_left`、`api_id_right` 两次连接 API 主表。",
