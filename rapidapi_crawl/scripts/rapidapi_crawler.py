@@ -29,7 +29,7 @@ GRAPHQL_URL = f"{BASE}/gateway/graphql"
 CSRF_URL = f"{BASE}/gateway/csrf"
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
 )
 
 
@@ -190,15 +190,43 @@ class RapidApiClient:
     def __init__(self, category: str) -> None:
         self.category = category
         self.session = requests.Session()
+        # macOS may expose a stale system proxy through urllib even when command-line
+        # clients connect directly. RapidAPI is public, so use a direct session.
+        self.session.trust_env = False
         self.session.headers.update({"User-Agent": UA})
         self.csrf_token = ""
 
     def init(self) -> None:
         search_url = f"{BASE}/search/{self.category.lower()}"
-        self.session.get(search_url, timeout=30)
-        r = self.session.get(CSRF_URL, headers={"Referer": search_url}, timeout=30)
-        r.raise_for_status()
-        self.csrf_token = r.json()["csrfToken"]
+        last_exc: Exception | None = None
+        for attempt in range(1, 9):
+            try:
+                landing = self.session.get(search_url, timeout=30)
+                if landing.status_code == 429:
+                    retry_after = landing.headers.get("Retry-After")
+                    try:
+                        wait = float(retry_after) if retry_after else min(120.0, 5.0 * 2 ** (attempt - 1))
+                    except ValueError:
+                        wait = min(120.0, 5.0 * 2 ** (attempt - 1))
+                    time.sleep(wait)
+                    continue
+                landing.raise_for_status()
+                r = self.session.get(CSRF_URL, headers={"Referer": search_url}, timeout=30)
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        wait = float(retry_after) if retry_after else min(120.0, 5.0 * 2 ** (attempt - 1))
+                    except ValueError:
+                        wait = min(120.0, 5.0 * 2 ** (attempt - 1))
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                self.csrf_token = r.json()["csrfToken"]
+                return
+            except (requests.RequestException, KeyError, ValueError) as exc:
+                last_exc = exc
+                time.sleep(min(120.0, 3.0 * attempt))
+        raise RuntimeError(f"CSRF initialization failed after retries: {last_exc}")
 
     def graphql(self, query: str, variables: dict[str, Any], operation: str, referer: str) -> dict[str, Any]:
         if not self.csrf_token:
@@ -215,7 +243,7 @@ class RapidApiClient:
         payload = {"query": query, "variables": variables, "operationName": operation}
         last_exc: Exception | None = None
         r = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 9):
             try:
                 r = self.session.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60)
                 if r.status_code in {419, 403}:
@@ -223,6 +251,15 @@ class RapidApiClient:
                     headers["csrf-token"] = self.csrf_token
                     headers["x-correlation-id"] = str(uuid.uuid4())
                     r = self.session.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60)
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        wait = float(retry_after) if retry_after else min(60.0, 5.0 * 2 ** (attempt - 1))
+                    except ValueError:
+                        wait = min(60.0, 5.0 * 2 ** (attempt - 1))
+                    time.sleep(wait)
+                    headers["x-correlation-id"] = str(uuid.uuid4())
+                    continue
                 break
             except requests.RequestException as exc:
                 last_exc = exc

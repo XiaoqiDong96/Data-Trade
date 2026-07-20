@@ -33,6 +33,86 @@ HEALTHCHECK_QUERY = """query getApiHealthCheck($apiId: String!) {
 }"""
 
 
+MECHANISM_QUERY = """query getApiStaticMechanisms(
+  $apiId: String!,
+  $apiOwnerSlug: String,
+  $apiSlug: String
+) {
+  healthcheckAnalytics(apiId: $apiId) {
+    total
+    failed
+    successful
+  }
+  apiBySlugifiedNameAndOwnerName(
+    slugifiedName: $apiSlug,
+    ownerName: $apiOwnerSlug
+  ) {
+    id
+    name
+    title
+    slugifiedName
+    owner { id name slugifiedName username }
+    billingPlans {
+      id
+      name
+      visibility
+      hidden
+      recommended
+      shouldRequestApproval
+      version { id }
+      allowedPlanDevelopers { userId }
+    }
+    spotlights {
+      id
+      apiId
+      type
+      weight
+      published
+      status
+      slugifiedName
+      title
+      description
+      spotlightURL
+      thumbnailURL
+    }
+  }
+}"""
+
+
+MECHANISM_BY_ID_QUERY = """query getApiStaticMechanismsById($apiId: ID!) {
+  api(id: $apiId) {
+    id
+    name
+    title
+    slugifiedName
+    owner { id name slugifiedName username }
+    billingPlans {
+      id
+      name
+      visibility
+      hidden
+      recommended
+      shouldRequestApproval
+      version { id }
+      allowedPlanDevelopers { userId }
+    }
+    spotlights {
+      id
+      apiId
+      type
+      weight
+      published
+      status
+      slugifiedName
+      title
+      description
+      spotlightURL
+      thumbnailURL
+    }
+  }
+}"""
+
+
 thread_state = threading.local()
 
 
@@ -81,52 +161,60 @@ def read_csv_rows(path: Path) -> list[dict[str, Any]]:
 
 def load_api_targets(root: Path, category: str) -> list[dict[str, Any]]:
     suffix = safe_name(category)
-    path = root / "data" / f"rapidapi_static_{suffix}_api_model_panel.csv"
-    rows = read_csv_rows(path)
-    if rows:
-        targets = []
-        seen = set()
+    targets_by_id: dict[str, dict[str, Any]] = {}
+    for path in [
+        root / "data_merged" / "rapidapi_merged_api_master.csv",
+        root / "data" / f"rapidapi_static_{suffix}_api_model_panel.csv",
+    ]:
+        rows = read_csv_rows(path)
         for row in rows:
             api_id = row.get("api_id")
-            if not api_id or api_id in seen:
+            if not api_id:
                 continue
-            seen.add(api_id)
-            targets.append(
-                {
-                    "api_id": api_id,
-                    "api_slug": row.get("api_slug"),
-                    "api_name": row.get("api_name"),
-                    "api_title": row.get("api_title"),
-                    "owner_slug": row.get("owner_slug"),
-                    "owner_name": row.get("owner_name"),
-                }
-            )
-        return targets
+            candidate = {
+                "api_id": api_id,
+                "api_slug": row.get("api_slug") or row.get("slugifiedName"),
+                "api_name": row.get("api_name") or row.get("name"),
+                "api_title": row.get("api_title") or row.get("title"),
+                "owner_slug": row.get("owner_slug")
+                or row.get("owner_username")
+                or row.get("owner_profile_owner_slug"),
+                "owner_name": row.get("owner_name") or row.get("owner_profile_owner_name"),
+            }
+            existing = targets_by_id.get(api_id)
+            if existing is None:
+                targets_by_id[api_id] = candidate
+            else:
+                for key, value in candidate.items():
+                    if key != "api_id" and not existing.get(key) and value:
+                        existing[key] = value
 
     raw_dir = root / "raw" / "graphql" / f"details_{suffix}"
-    targets = []
-    seen = set()
     for raw_path in sorted(raw_dir.glob("*.json")):
         try:
             api = (read_json(raw_path).get("data") or {}).get("apiBySlugifiedNameAndOwnerName") or {}
         except Exception:
             continue
         api_id = api.get("id")
-        if not api_id or api_id in seen:
+        if not api_id:
             continue
-        seen.add(api_id)
         owner = api.get("owner") or {}
-        targets.append(
-            {
-                "api_id": api_id,
-                "api_slug": api.get("slugifiedName"),
-                "api_name": api.get("name"),
-                "api_title": api.get("title"),
-                "owner_slug": owner.get("slugifiedName") or owner.get("username"),
-                "owner_name": owner.get("name"),
-            }
-        )
-    return targets
+        candidate = {
+            "api_id": api_id,
+            "api_slug": api.get("slugifiedName"),
+            "api_name": api.get("name"),
+            "api_title": api.get("title"),
+            "owner_slug": owner.get("slugifiedName") or owner.get("username"),
+            "owner_name": owner.get("name"),
+        }
+        existing = targets_by_id.get(api_id)
+        if existing is None:
+            targets_by_id[api_id] = candidate
+        else:
+            for key, value in candidate.items():
+                if key != "api_id" and not existing.get(key) and value:
+                    existing[key] = value
+    return list(targets_by_id.values())
 
 
 def get_thread_client(category: str) -> RapidApiClient:
@@ -143,6 +231,10 @@ def health_raw_path(root: Path, category: str, api_id: str) -> Path:
     return root / "raw" / "graphql" / f"additional_{safe_name(category)}" / "healthcheck" / f"{safe_name(api_id)}.json"
 
 
+def mechanism_raw_path(root: Path, category: str, api_id: str) -> Path:
+    return root / "raw" / "graphql" / f"additional_{safe_name(category)}" / "mechanisms" / f"{safe_name(api_id)}.json"
+
+
 def should_fetch(path: Path, retry_errors: bool) -> bool:
     if not path.exists():
         return True
@@ -153,6 +245,11 @@ def should_fetch(path: Path, retry_errors: bool) -> bool:
     except Exception:
         return True
     return "__error__" in data
+
+
+def is_not_found_error(error: Any) -> bool:
+    text = str(error).lower()
+    return "not_found" in text and ("api not found" in text or "user not found" in text or " not found" in text)
 
 
 def fetch_healthcheck_one(
@@ -212,11 +309,142 @@ def fetch_healthchecks(
     return counts
 
 
+def fetch_mechanism_one(
+    root: Path,
+    category: str,
+    target: dict[str, Any],
+    delay: float,
+    retry_errors: bool,
+) -> dict[str, Any]:
+    api_id = target["api_id"]
+    raw_path = mechanism_raw_path(root, category, api_id)
+    if not should_fetch(raw_path, retry_errors):
+        return {"api_id": api_id, "status": "skip"}
+
+    owner_slug = target.get("owner_slug")
+    api_slug = target.get("api_slug")
+    if not owner_slug or not api_slug:
+        atomic_write_json(
+            raw_path,
+            {
+                "__api_id": api_id,
+                "__fetched_at": utc_now(),
+                "__error__": "missing owner_slug or api_slug",
+            },
+        )
+        return {"api_id": api_id, "status": "error"}
+
+    client = get_thread_client(category)
+    referer = "https://rapidapi.com/search/Data"
+    variables = {"apiId": api_id, "apiOwnerSlug": owner_slug, "apiSlug": api_slug}
+    try:
+        data = client.graphql(MECHANISM_QUERY, variables, "getApiStaticMechanisms", referer)
+        data["__api_id"] = api_id
+        data["__fetched_at"] = utc_now()
+        data["__lookup_mode"] = "slug_owner"
+        atomic_write_json(raw_path, data)
+        status = "ok"
+    except Exception as exc:
+        if is_not_found_error(exc):
+            detail_error = str(exc)
+            try:
+                detail_data = client.graphql(
+                    MECHANISM_BY_ID_QUERY,
+                    {"apiId": api_id},
+                    "getApiStaticMechanismsById",
+                    referer,
+                )
+                api = (detail_data.get("data") or {}).get("api")
+                detail_error = "" if api else detail_error
+            except Exception as id_exc:
+                api = None
+                detail_error = str(id_exc)
+
+            try:
+                health_data = client.graphql(
+                    HEALTHCHECK_QUERY,
+                    {"apiId": api_id},
+                    "getApiHealthCheck",
+                    referer,
+                )
+                health = (health_data.get("data") or {}).get("healthcheckAnalytics")
+                health_error = ""
+            except Exception as health_exc:
+                health = None
+                health_error = str(health_exc)
+
+            payload = {
+                "data": {
+                    "healthcheckAnalytics": health,
+                    "apiBySlugifiedNameAndOwnerName": api,
+                },
+                "__api_id": api_id,
+                "__fetched_at": utc_now(),
+                "__lookup_mode": "api_id_fallback",
+                "__slug_lookup_error": str(exc),
+            }
+            if detail_error:
+                payload["__terminal_detail_error"] = detail_error
+            if health_error:
+                payload["__health_error"] = health_error
+            if detail_error and health_error:
+                payload["__error__"] = f"detail={detail_error}; health={health_error}"
+                status = "error"
+            elif detail_error:
+                status = "terminal"
+            else:
+                status = "ok"
+            atomic_write_json(raw_path, payload)
+        else:
+            atomic_write_json(
+                raw_path,
+                {"__api_id": api_id, "__fetched_at": utc_now(), "__error__": str(exc), "variables": variables},
+            )
+            status = "error"
+    if delay:
+        time.sleep(delay)
+    return {"api_id": api_id, "status": status}
+
+
+def fetch_mechanisms(
+    root: Path,
+    category: str,
+    workers: int,
+    delay: float,
+    retry_errors: bool,
+    limit: int,
+) -> dict[str, int]:
+    targets = load_api_targets(root, category)
+    if limit:
+        targets = targets[:limit]
+    counts = {"ok": 0, "skip": 0, "terminal": 0, "error": 0}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [
+            pool.submit(fetch_mechanism_one, root, category, target, delay, retry_errors)
+            for target in targets
+        ]
+        for idx, fut in enumerate(as_completed(futures), 1):
+            result = fut.result()
+            counts[result["status"]] = counts.get(result["status"], 0) + 1
+            if idx % 100 == 0 or idx == len(futures):
+                print(
+                    f"mechanisms {idx}/{len(futures)} "
+                    f"ok={counts.get('ok', 0)} skip={counts.get('skip', 0)} "
+                    f"terminal={counts.get('terminal', 0)} error={counts.get('error', 0)}",
+                    flush=True,
+                )
+    return counts
+
+
 def normalize_healthchecks(root: Path, category: str, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     target_by_id = {row["api_id"]: row for row in targets}
-    raw_dir = root / "raw" / "graphql" / f"additional_{safe_name(category)}" / "healthcheck"
+    mechanism_dir = root / "raw" / "graphql" / f"additional_{safe_name(category)}" / "mechanisms"
+    legacy_dir = root / "raw" / "graphql" / f"additional_{safe_name(category)}" / "healthcheck"
+    raw_paths = sorted(mechanism_dir.glob("*.json"))
+    if not raw_paths:
+        raw_paths = sorted(legacy_dir.glob("*.json"))
     rows: list[dict[str, Any]] = []
-    for raw_path in sorted(raw_dir.glob("*.json")):
+    for raw_path in raw_paths:
         try:
             data = read_json(raw_path)
         except Exception as exc:
@@ -243,7 +471,10 @@ def normalize_healthchecks(root: Path, category: str, targets: list[dict[str, An
                 "health_failure_rate": failure_rate,
                 "health_success_rate": success_rate,
                 "has_healthcheck_data": bool_int(total is not None or failed is not None or successful is not None),
-                "health_error": data.get("__error__"),
+                "health_error": data.get("__health_error") or data.get("__error__"),
+                "detail_lookup_error": data.get("__terminal_detail_error") or data.get("__slug_lookup_error"),
+                "detail_lookup_terminal": bool_int(data.get("__terminal_detail_error")),
+                "detail_lookup_mode": data.get("__lookup_mode"),
                 "fetched_at": data.get("__fetched_at"),
                 "raw_file": str(raw_path),
             }
@@ -252,6 +483,18 @@ def normalize_healthchecks(root: Path, category: str, targets: list[dict[str, An
 
 
 def iter_detail_apis(root: Path, category: str):
+    mechanism_dir = root / "raw" / "graphql" / f"additional_{safe_name(category)}" / "mechanisms"
+    mechanism_paths = sorted(mechanism_dir.glob("*.json"))
+    if mechanism_paths:
+        for raw_path in mechanism_paths:
+            try:
+                api = (read_json(raw_path).get("data") or {}).get("apiBySlugifiedNameAndOwnerName") or {}
+            except Exception:
+                continue
+            if api:
+                yield raw_path, api
+        return
+
     raw_dir = root / "raw" / "graphql" / f"details_{safe_name(category)}"
     for raw_path in sorted(raw_dir.glob("*.json")):
         try:
@@ -401,8 +644,8 @@ def main() -> None:
     targets = load_api_targets(root, args.category)
     summary: dict[str, Any] = {"category": args.category, "api_targets": len(targets)}
 
-    if "healthcheck" in kinds and not args.normalize_only:
-        summary["healthcheck_fetch"] = fetch_healthchecks(
+    if {"healthcheck", "detail_extras"} & kinds and not args.normalize_only:
+        summary["mechanism_fetch"] = fetch_mechanisms(
             root=root,
             category=args.category,
             workers=args.workers,

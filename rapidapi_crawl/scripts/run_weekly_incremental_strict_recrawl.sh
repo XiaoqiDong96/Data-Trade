@@ -10,15 +10,14 @@ if [[ ! -x "$PY" ]]; then
   exit 2
 fi
 
-RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-$(cat "$ROOT/logs/rapidapi_weekly_incremental/latest_run")}"
 HISTORY_DIR="$ROOT/rapidapi_crawl/data_incremental"
-WORK_ROOT="$HISTORY_DIR/work_${RUN_ID}"
+WORK_ROOT="$HISTORY_DIR/work_strict_${RUN_ID}"
 OUT_DIR="$HISTORY_DIR/${RUN_ID}"
 LOG_DIR="$ROOT/logs/rapidapi_weekly_incremental"
-LOG_FILE="$LOG_DIR/run_${RUN_ID}.log"
-STATUS_FILE="$LOG_DIR/status_${RUN_ID}.json"
+LOG_FILE="$LOG_DIR/strict_recrawl_${RUN_ID}.log"
+STATUS_FILE="$LOG_DIR/strict_status_${RUN_ID}.json"
 
-DISCOVERY_DELAY="${DISCOVERY_DELAY:-0.45}"
 DETAIL_WORKERS="${DETAIL_WORKERS:-3}"
 DETAIL_DELAY="${DETAIL_DELAY:-0.70}"
 STATIC_WORKERS="${STATIC_WORKERS:-3}"
@@ -27,7 +26,6 @@ ADDITIONAL_WORKERS="${ADDITIONAL_WORKERS:-3}"
 ADDITIONAL_DELAY="${ADDITIONAL_DELAY:-0.70}"
 EXPOSURE_WORKERS="${EXPOSURE_WORKERS:-3}"
 EXPOSURE_DELAY="${EXPOSURE_DELAY:-0.70}"
-EXPOSURE_TERMS_MODE="${EXPOSURE_TERMS_MODE:-comprehensive}"
 EXPOSURE_MAX_PAGES="${EXPOSURE_MAX_PAGES:-10}"
 EXTERNAL_WORKERS="${EXTERNAL_WORKERS:-2}"
 EXTERNAL_DELAY="${EXTERNAL_DELAY:-0.75}"
@@ -69,71 +67,48 @@ run() {
   local step="$1"
   shift
   echo
-  echo "===== $(ts) START $step ====="
+  echo "===== $(ts) START strict: $step ====="
   status "$step" "running" "$*"
   "$@"
-  echo "===== $(ts) DONE $step ====="
+  echo "===== $(ts) DONE strict: $step ====="
 }
 
 on_error() {
   local code=$?
   local line=${BASH_LINENO[0]:-unknown}
-  echo "===== $(ts) ERROR line=$line exit=$code ====="
+  echo "===== $(ts) ERROR strict line=$line exit=$code ====="
   status "error" "failed" "line=$line exit=$code"
   exit "$code"
 }
 trap on_error ERR
 
-echo "RapidAPI weekly incremental update"
+echo "RapidAPI strict incremental recrawl"
 echo "root=$ROOT"
 echo "run_id=$RUN_ID"
 echo "work_root=$WORK_ROOT"
 echo "out_dir=$OUT_DIR"
 echo "log=$LOG_FILE"
-status "started" "running" "weekly incremental update initialized"
+status "started" "running" "strict recrawl initialized"
 
-run "search_window" \
-  "$PY" rapidapi_crawl/scripts/rapidapi_crawler.py \
-  --root "$WORK_ROOT" \
-  --category Data \
-  --first 100 \
-  --max-pages 0 \
-  --delay "$DISCOVERY_DELAY"
+rm -rf "$WORK_ROOT"
+mkdir -p "$WORK_ROOT/data"
 
-run "broad_discovery" \
-  "$PY" rapidapi_crawl/scripts/rapidapi_discovery_crawler.py \
-  --root "$WORK_ROOT" \
-  --category Data \
-  --terms-mode broad \
-  --first 100 \
-  --max-pages-per-combo 0 \
-  --delay "$DISCOVERY_DELAY" \
-  --seed-existing
-
-run "prepare_new_api_list" \
-  "$PY" rapidapi_crawl/scripts/build_weekly_incremental_delta.py prepare \
-  --work-root "$WORK_ROOT" \
-  --merged-dir rapidapi_crawl/data_merged \
-  --history-dir rapidapi_crawl/data_incremental \
-  --out-dir "$OUT_DIR" \
-  --run-id "$RUN_ID"
-
-NEW_COUNT=$("$PY" - "$OUT_DIR/rapidapi_weekly_prepare_summary.json" <<'PY'
-import json
+run "seed_new_candidates" \
+  "$PY" - "$OUT_DIR" "$WORK_ROOT" <<'PY'
+import shutil
 import sys
-path = sys.argv[1]
-with open(path, encoding="utf-8") as f:
-    print(json.load(f).get("new_api_candidates", 0))
-PY
-)
-echo "new_api_candidates=$NEW_COUNT"
+from pathlib import Path
 
-if [[ "$NEW_COUNT" == "0" ]]; then
-  rm -rf "$WORK_ROOT"
-  status "complete" "complete" "no new API ids found"
-  echo "===== $(ts) COMPLETE no new API ids ====="
-  exit 0
-fi
+out_dir = Path(sys.argv[1])
+work_root = Path(sys.argv[2])
+src = out_dir / "rapidapi_weekly_new_candidates.csv"
+if not src.exists():
+    raise SystemExit(f"missing candidates: {src}")
+dst = work_root / "data" / "rapidapi_discovery_Data_apis.csv"
+dst.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(src, dst)
+shutil.copy2(src, work_root / "data" / "rapidapi_discovery_Data_all_apis.csv")
+PY
 
 run "detail_new_apis" \
   "$PY" rapidapi_crawl/scripts/rapidapi_detail_parallel.py \
@@ -154,12 +129,12 @@ run "normalize_new_details" \
   --details-limit 0 \
   --details-offline-only
 
-run "base_new_plan_panel" \
+run "base_plan_panel" \
   "$PY" rapidapi_crawl/scripts/build_rapidapi_panel.py \
   --root "$WORK_ROOT" \
   --category Data
 
-run "static_new_enrichment" \
+run "static_enrichment_playground_billing_owner" \
   "$PY" rapidapi_crawl/scripts/rapidapi_static_enrichment.py \
   --root "$WORK_ROOT" \
   --category Data \
@@ -168,12 +143,12 @@ run "static_new_enrichment" \
   --delay "$STATIC_DELAY" \
   --retry-errors
 
-run "static_new_panel" \
+run "static_enriched_panel" \
   "$PY" rapidapi_crawl/scripts/build_static_enriched_panel.py \
   --root "$WORK_ROOT" \
   --category Data
 
-run "additional_new_market_data" \
+run "additional_health_restrictions_spotlights" \
   "$PY" rapidapi_crawl/scripts/rapidapi_additional_market_data.py \
   --root "$WORK_ROOT" \
   --category Data \
@@ -244,7 +219,6 @@ for text in texts:
         for pair in zip(words, words[1:])
         if all(len(x) >= 3 and x not in stop for x in pair)
     )
-
 def clean_terms(values):
     out, seen = [], set()
     for value in values:
@@ -254,7 +228,6 @@ def clean_terms(values):
         seen.add(term)
         out.append(term)
     return out
-
 common = clean_terms(domain_seed + [t for t, _ in token_counts.most_common(80)])[:90]
 extra = clean_terms([t for t, _ in phrase_counts.most_common(120)])[:90]
 tail_candidates = [
@@ -268,11 +241,11 @@ tail = clean_terms(sorted(tail_candidates))[:70]
 print({"common_terms": len(common), "extra_terms": len(extra), "tail_terms": len(tail)})
 PY
 
-run "search_exposure_for_new_filter" \
+run "search_exposure_comprehensive" \
   "$PY" rapidapi_crawl/scripts/rapidapi_search_exposure_crawler.py \
   --root "$WORK_ROOT" \
   --category Data \
-  --terms-mode "$EXPOSURE_TERMS_MODE" \
+  --terms-mode comprehensive \
   --first 100 \
   --max-pages-per-combo "$EXPOSURE_MAX_PAGES" \
   --workers "$EXPOSURE_WORKERS" \
@@ -280,12 +253,12 @@ run "search_exposure_for_new_filter" \
   --retry-errors \
   --save-every 25
 
-run "additional_new_panel" \
+run "additional_market_panel" \
   "$PY" rapidapi_crawl/scripts/build_additional_market_panel.py \
   --root "$WORK_ROOT" \
   --category Data
 
-run "build_aligned_delta_tables" \
+run "build_aligned_delta_tables_full_merge_logic" \
   "$PY" rapidapi_crawl/scripts/build_weekly_incremental_delta.py build \
   --work-root "$WORK_ROOT" \
   --merged-dir rapidapi_crawl/data_merged \
@@ -301,7 +274,7 @@ run "external_enrichment_for_new_apis" \
   --workers "$EXTERNAL_WORKERS" \
   --delay "$EXTERNAL_DELAY"
 
-run "validate_incremental_bundle" \
+run "strict_validation" \
   "$PY" - "$OUT_DIR" <<'PY'
 import json
 import sys
@@ -311,29 +284,25 @@ import pandas as pd
 
 out_dir = Path(sys.argv[1])
 checks = {}
-paths = sorted(out_dir.glob("*.csv"))
-external_dir = out_dir / "external_incremental"
-if external_dir.exists():
-    paths.extend(sorted(external_dir.glob("*.csv")))
-for path in paths:
-    if path.stat().st_size == 0:
+for path in sorted(list(out_dir.glob("*.csv")) + list((out_dir / "external_incremental").glob("*.csv"))):
+    if not path.exists() or path.stat().st_size == 0:
         continue
-    frame = pd.read_csv(path, dtype=str, low_memory=False).fillna("")
-    empty = [column for column in frame.columns if frame[column].astype(str).str.strip().eq("").all()]
+    df = pd.read_csv(path, dtype=str, low_memory=False).fillna("")
+    empty = [c for c in df.columns if df[c].astype(str).str.strip().eq("").all()]
     checks[str(path.relative_to(out_dir))] = {
-        "rows": int(len(frame)),
-        "columns": int(len(frame.columns)),
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
         "all_empty_columns": empty,
         "all_empty_column_count": len(empty),
     }
 manifest = {
-    "validated_at_utc": pd.Timestamp.utcnow().isoformat(),
+    "strict_validated_at_utc": pd.Timestamp.utcnow().isoformat(),
     "checks": checks,
     "files_with_all_empty_columns": {
         name: info for name, info in checks.items() if info["all_empty_column_count"]
     },
 }
-(out_dir / "rapidapi_weekly_incremental_validation.json").write_text(
+(out_dir / "rapidapi_weekly_strict_recrawl_validation.json").write_text(
     json.dumps(manifest, ensure_ascii=False, indent=2),
     encoding="utf-8",
 )
@@ -348,6 +317,5 @@ run "promote_validated_delta" \
 run "refresh_data_handoff_docs" \
   "$PY" rapidapi_crawl/scripts/build_data_handoff_docs.py
 
-rm -rf "$WORK_ROOT"
-status "complete" "complete" "weekly incremental bundle validated and promoted from $OUT_DIR"
-echo "===== $(ts) COMPLETE weekly incremental update ====="
+status "complete" "complete" "strict recrawl finished"
+echo "===== $(ts) COMPLETE strict recrawl ====="

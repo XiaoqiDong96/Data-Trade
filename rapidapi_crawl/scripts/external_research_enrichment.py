@@ -144,10 +144,12 @@ def request(
     error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.request(
-                method, url, params=params, json=json_body, headers=merged,
-                timeout=timeout, allow_redirects=True,
-            )
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.request(
+                    method, url, params=params, json=json_body, headers=merged,
+                    timeout=timeout, allow_redirects=True,
+                )
             if response.status_code == 429 or response.status_code >= 500:
                 raise RuntimeError(f"HTTP {response.status_code}")
             response.raise_for_status()
@@ -795,6 +797,41 @@ def stage_competitors(root: Path, workers: int, delay: float, retry_errors: bool
     for loc in re.findall(r"<loc>(.*?)</loc>", sitemap):
         if re.fullmatch(r"https://api-ninjas\.com/api/[^/?#]+", loc):
             ninja_jobs.append((loc, "api_ninjas", loc.rsplit("/", 1)[-1], ""))
+
+    apis_guru_cache = raw / "apis_guru" / "list.json"
+    if should_fetch(apis_guru_cache, retry_errors):
+        guru_listing = request("GET", "https://api.apis.guru/v2/list.json").json()
+        atomic_json(apis_guru_cache, guru_listing)
+    else:
+        guru_listing = read_json(apis_guru_cache)
+    guru_products = []
+    for provider, provider_data in guru_listing.items():
+        preferred = provider_data.get("preferred")
+        version = (provider_data.get("versions") or {}).get(preferred) or {}
+        info = version.get("info") or {}
+        categories = info.get("x-apisguru-categories") or []
+        guru_products.append(
+            {
+                "market": "apis_guru",
+                "market_product_id": provider,
+                "product_url": version.get("link") or version.get("swaggerUrl"),
+                "product_slug": provider,
+                "product_title": clean_text(info.get("title")),
+                "product_description": clean_text(info.get("description")),
+                "category": "|".join(str(value) for value in categories),
+                "prices_usd_json": "[]",
+                "min_public_price_usd": None,
+                "max_public_price_usd": None,
+                "has_free_text": None,
+                "endpoint_count_visible": None,
+                "endpoints_json": "[]",
+                "page_bytes": None,
+                "http_status": 200,
+                "fetched_at": utc_now(),
+                "openapi_version": version.get("openapiVer"),
+                "spec_url": version.get("swaggerUrl"),
+            }
+        )
     jobs = (apilayer_jobs + ninja_jobs)[:limit or None]
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {}
@@ -815,6 +852,23 @@ def stage_competitors(root: Path, workers: int, delay: float, retry_errors: bool
             if idx % 50 == 0 or idx == len(futures):
                 print(f"competitors {idx}/{len(futures)}", flush=True)
 
+    products.extend(guru_products)
+
+    unique_products: dict[tuple[str, str], dict[str, Any]] = {}
+    for product in products:
+        market = clean_text(product.get("market"))
+        product_id = clean_text(product.get("market_product_id")) or clean_text(product.get("product_url"))
+        key = (market, product_id)
+        existing = unique_products.get(key)
+        if existing is None:
+            unique_products[key] = product
+            continue
+        existing_quality = int(not existing.get("error")) + int(bool(existing.get("product_description")))
+        new_quality = int(not product.get("error")) + int(bool(product.get("product_description")))
+        if new_quality > existing_quality:
+            unique_products[key] = product
+    products = list(unique_products.values())
+
     pricing = scrape_product("https://api-ninjas.com/pricing", "api_ninjas_pricing", "plans")
     atomic_json(raw / "api_ninjas" / "pricing.json", pricing)
     save_csv(root / "data_external" / "competitor_products.csv", products)
@@ -822,14 +876,17 @@ def stage_competitors(root: Path, workers: int, delay: float, retry_errors: bool
     apis = load_apis(root).fillna("")
     token_index: dict[str, set[int]] = defaultdict(set)
     product_tokens: list[set[str]] = []
+    product_texts: list[str] = []
     for idx, product in enumerate(products):
         value = " ".join([clean_text(product.get("product_title")), clean_text(product.get("product_slug")), clean_text(product.get("product_description"))])
         tok = tokens(value)
+        product_texts.append(value.lower())
         product_tokens.append(tok)
         for token in tok:
             token_index[token].add(idx)
     matches = []
-    for row in apis.to_dict("records"):
+    api_records = apis.to_dict("records")
+    for api_index, row in enumerate(api_records, 1):
         api_text = " ".join([clean_text(row.get("api_title")), clean_text(row.get("api_name")), clean_text(row.get("api_slug")), clean_text(row.get("api_description"))])
         api_tokens = tokens(api_text)
         candidates: set[int] = set()
@@ -837,9 +894,15 @@ def stage_competitors(root: Path, workers: int, delay: float, retry_errors: bool
             candidates.update(token_index.get(token, set()))
         scored = []
         for idx in candidates:
-            product = products[idx]
-            ptext = " ".join([clean_text(product.get("product_title")), clean_text(product.get("product_slug")), clean_text(product.get("product_description"))])
-            score = similarity(api_text, ptext)
+            product_token_set = product_tokens[idx]
+            union = api_tokens | product_token_set
+            jaccard = len(api_tokens & product_token_set) / len(union) if union else 0.0
+            # With a maximum sequence score of one, lower Jaccard values cannot
+            # reach the final 0.42 acceptance threshold.
+            if jaccard < (0.42 - 0.35) / 0.65:
+                continue
+            sequence = SequenceMatcher(None, api_text.lower()[:600], product_texts[idx][:600]).ratio()
+            score = 0.65 * jaccard + 0.35 * sequence
             if score >= 0.42:
                 scored.append((score, idx))
         for rank, (score, idx) in enumerate(sorted(scored, reverse=True)[:5], 1):
@@ -851,6 +914,8 @@ def stage_competitors(root: Path, workers: int, delay: float, retry_errors: bool
                 "min_public_price_usd": product.get("min_public_price_usd"),
                 "has_free_text": product.get("has_free_text"),
             })
+        if api_index % 500 == 0 or api_index == len(api_records):
+            print(f"competitor matching {api_index}/{len(api_records)} matches={len(matches)}", flush=True)
     save_csv(
         root / "data_external" / "competitor_matches.csv", matches,
         ["api_id", "match_rank", "match_score", "market", "market_product_id", "product_title", "product_url", "min_public_price_usd", "has_free_text"],

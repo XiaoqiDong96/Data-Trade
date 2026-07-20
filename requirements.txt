@@ -4,3 +4,7 @@ matplotlib
 statsmodels
 requests
 selenium
+scipy
+linearmodels
+pyblp
+pyhdfe

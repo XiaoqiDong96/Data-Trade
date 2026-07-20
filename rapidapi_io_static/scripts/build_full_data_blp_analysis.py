@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import warnings
 from pathlib import Path
@@ -14,7 +15,7 @@ import pandas as pd
 import pyblp
 import pyhdfe
 import statsmodels.api as sm
-from linearmodels.iv import IV2SLS
+from linearmodels.iv import IV2SLS, IVLIML
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,13 +25,15 @@ TABLES = OUT / "tables"
 FIGURES = OUT / "figures"
 REPORT = OUT / "report"
 DATA = OUT / "data"
-SNAPSHOT_DATE = pd.Timestamp("2026-07-13", tz="UTC")
+SNAPSHOT_DATE = pd.Timestamp.now(tz="UTC").normalize()
 
 LABELS = {
     "has_free_plan": "Free plan",
     "ln_price": "Log minimum paid price",
     "prices": "Minimum paid price / 100",
     "trial_learning": "Free plan x ex ante uncertainty",
+    "trial_signal_precision": "Trial signal precision",
+    "bayes_learning_index": "Calibrated Bayesian learning value",
     "ln_free_quota": "Log free quota",
     "ln_max_paid_quota": "Log maximum paid quota",
     "data_scope_index": "Data scope",
@@ -54,6 +57,7 @@ LABELS = {
     "endpoint_limit": "Endpoint-restricted plan",
     "rate_limit": "Rate limit present",
     "restricted_dev": "Named developers only",
+    "has_restricted_plan": "Named-developer restriction",
     "ln_subscriptions": "Log platform subscriptions",
     "api_has_free_plan": "Free plan",
     "api_data_scope_index": "Data scope",
@@ -168,6 +172,7 @@ def load_api_data() -> pd.DataFrame:
         "schema_near_substitutes_020",
         "github_repository_count",
         "menu_has_overage",
+        "has_restricted_plan",
         "menu_has_hard_limit",
         "menu_has_soft_limit",
         "menu_has_rate_limit",
@@ -188,6 +193,20 @@ def load_api_data() -> pd.DataFrame:
     api["prices"] = api["upgrade_price_usd"] / 100
     api["entry_prices"] = api["prices"] * (1 - api["has_free_plan"])
     api["trial_learning"] = api["has_free_plan"] * api["uncertainty_index"]
+    quota_precision = zscore(api["ln_free_quota"])
+    disclosure_precision = zscore(api["disclosure_index"])
+    reliability_precision = zscore(api["reliability_index"])
+    api["trial_signal_precision"] = api["has_free_plan"] * zscore(
+        0.50 * quota_precision + 0.25 * disclosure_precision + 0.25 * reliability_precision
+    )
+    prior_variance = np.exp(np.clip(zscore(api["uncertainty_index"]), -2.5, 2.5))
+    signal_precision = np.exp(np.clip(
+        0.50 * quota_precision + 0.25 * disclosure_precision + 0.25 * reliability_precision,
+        -2.5,
+        2.5,
+    ))
+    variance_reduction = prior_variance - 1 / (1 / prior_variance + signal_precision)
+    api["bayes_learning_index"] = api["has_free_plan"] * zscore(variance_reduction)
     api["ln_schema_near"] = np.log1p(api["schema_near_substitutes_020"])
     api["ln_owner_size"] = np.log1p(api["published_apis_count"])
     api["ln_subscriptions"] = np.log1p(api["subscriptions_count"])
@@ -202,6 +221,12 @@ def load_api_data() -> pd.DataFrame:
     api["delta_logit"] = np.log(api["shares"]) - np.log(0.80)
     api["open_score_z"] = zscore(api["open_best_score"])
     api["schema_overlap_z"] = zscore(api["schema_overlap_best"])
+    api["reuse_rank"] = (
+        zscore(api["data_scope_index"])
+        + zscore(api["schema_overlap_best"])
+        + zscore(np.log1p(api["github_repository_count"]))
+    ).rank(pct=True)
+    api["clustering_ids"] = api["owner_key"]
     return api
 
 
@@ -228,6 +253,127 @@ def sample_audit(api: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def fundamental_analysis(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    variables = [
+        "subscriptions_count",
+        "q_flow",
+        "min_paid_price",
+        "free_quota",
+        "max_paid_quota",
+        "public_plan_count",
+        "endpoint_count",
+        "data_scope_index",
+        "data_complexity_index",
+        "disclosure_index",
+        "reliability_index",
+        "versioning_index",
+        "restricted_access_index",
+        "exposure_index",
+    ]
+    rows = []
+    for variable in variables:
+        values = numeric(api[variable]).replace([np.inf, -np.inf], np.nan).dropna()
+        rows.append(
+            {
+                "Variable": LABELS.get(variable, variable),
+                "N": len(values),
+                "Mean": float(values.mean()),
+                "SD": float(values.std()),
+                "P10": float(values.quantile(0.10)),
+                "P25": float(values.quantile(0.25)),
+                "P50": float(values.quantile(0.50)),
+                "P75": float(values.quantile(0.75)),
+                "P90": float(values.quantile(0.90)),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    save_table("fundamental_summary_statistics", summary)
+
+    market_rows = []
+    for market, group in api.groupby("primary_type", sort=False):
+        adoption = group["q_obs"].to_numpy(float)
+        shares = adoption / adoption.sum()
+        owners = group.groupby("owner_key")["q_obs"].sum()
+        owner_shares = owners / owners.sum()
+        market_rows.append(
+            {
+                "Use-case market": market,
+                "APIs": len(group),
+                "Owners": group["owner_key"].nunique(),
+                "Platform subscriptions": int(group["subscriptions_count"].sum()),
+                "Free-plan share": float(group["has_free_plan"].mean()),
+                "Positive-upgrade-price share": float((group["min_paid_price"] > 0).mean()),
+                "Median upgrade price": float(group.loc[group["min_paid_price"] > 0, "min_paid_price"].median()),
+                "Product adoption HHI": float(np.square(shares).sum()),
+                "Owner adoption HHI": float(np.square(owner_shares).sum()),
+                "Top-four product share": float(np.sort(shares)[-4:].sum()),
+            }
+        )
+    markets = pd.DataFrame(market_rows).sort_values("APIs", ascending=False).reset_index(drop=True)
+    save_table("fundamental_market_structure", markets)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.5))
+    order = markets.sort_values("APIs")
+    axes[0].barh(order["Use-case market"], order["APIs"], color="#15616d")
+    axes[0].set(xlabel="Number of APIs", ylabel="")
+    axes[1].scatter(markets["Product adoption HHI"], markets["Free-plan share"], color="#a23e48")
+    for _, row in markets.iterrows():
+        axes[1].annotate(str(row["Use-case market"]), (row["Product adoption HHI"], row["Free-plan share"]), fontsize=7, xytext=(3, 2), textcoords="offset points")
+    axes[1].set(xlabel="Product adoption HHI", ylabel="Free-plan share")
+    for ax in axes:
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "fundamental_market_structure.png", dpi=220)
+    plt.close(fig)
+    return summary, markets, {
+        "api_count": len(api),
+        "owner_count": int(api["owner_key"].nunique()),
+        "market_count": int(api["primary_type"].nunique()),
+        "free_share": float(api["has_free_plan"].mean()),
+        "positive_price_share": float((api["min_paid_price"] > 0).mean()),
+        "median_positive_price": float(api.loc[api["min_paid_price"] > 0, "min_paid_price"].median()),
+    }
+
+
+def contract_descriptives(api: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+    plans = pd.read_csv(CRAWL / "data_merged" / "rapidapi_merged_plan_contracts.csv", low_memory=False)
+    for column in [
+        "is_public_plan",
+        "is_hidden_plan",
+        "is_paid_plan",
+        "requires_approval",
+        "rateLimit_enabled",
+        "max_overage_price",
+        "plan_mapped_endpoints_count",
+        "plan_all_endpoint_items_count",
+        "access_allowed_plan_developers_count",
+    ]:
+        plans[column] = numeric(plans[column])
+    public = plans.loc[(plans["is_public_plan"] == 1) & (plans["is_hidden_plan"] == 0)].copy()
+    spotlight = api["spotlights_count_y"] if "spotlights_count_y" in api else pd.Series(0, index=api.index)
+    facts = [
+        ("APIs with a free plan", float(api["has_free_plan"].mean()), len(api)),
+        ("APIs with an overage contract", float(api["menu_has_overage"].mean()), len(api)),
+        ("APIs with a rate limit", float(api["menu_has_rate_limit"].mean()), len(api)),
+        ("APIs with endpoint-specific limits", float((api["menu_endpoint_limited_share"] > 0).mean()), len(api)),
+        ("APIs with public healthcheck data", float(api["has_healthcheck_data"].mean()), len(api)),
+        ("APIs with a spotlight", float((numeric(spotlight) > 0).mean()), len(api)),
+        ("Public plans requiring approval", float((public["requires_approval"] > 0).mean()), len(public)),
+        ("Public plans with rate limits", float((public["rateLimit_enabled"] > 0).mean()), len(public)),
+        ("Public plans with positive overage fees", float((public["max_overage_price"] > 0).mean()), len(public)),
+        (
+            "Public plans restricted to named developers",
+            float((public["access_allowed_plan_developers_count"] > 0).mean()),
+            len(public),
+        ),
+    ]
+    table = pd.DataFrame(facts, columns=["Contract fact", "Share", "Denominator"])
+    table["Percent"] = 100 * table["Share"]
+    save_table("contract_descriptive_facts", table[["Contract fact", "Percent", "Denominator"]])
+    key = {row[0]: row[1] for row in facts}
+    return table, key
+
+
 def adoption_reduced_form(api: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
     variables = [
         "has_free_plan",
@@ -240,6 +386,7 @@ def adoption_reduced_form(api: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, fl
         "disclosure_index",
         "reliability_index",
         "versioning_index",
+        "has_restricted_plan",
         "open_best_score",
         "ln_schema_near",
         "ln_owner_size",
@@ -309,6 +456,207 @@ def adoption_reduced_form(api: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, fl
         "owner_fe_owners": int(within["owner_key"].nunique()),
     }
     return table, key
+
+
+def trial_learning_reduced_form(api: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+    common = [
+        "ln_price",
+        "data_scope_index",
+        "data_complexity_index",
+        "disclosure_index",
+        "reliability_index",
+        "versioning_index",
+        "has_restricted_plan",
+        "open_best_score",
+        "ln_schema_near",
+        "ln_owner_size",
+    ]
+    specifications = [
+        ("Free x uncertainty", "trial_learning", ["has_free_plan", "trial_learning", "ln_free_quota"]),
+        (
+            "Signal precision",
+            "trial_signal_precision",
+            ["has_free_plan", "uncertainty_index", "trial_signal_precision"],
+        ),
+        ("Bayesian variance reduction", "bayes_learning_index", ["has_free_plan", "bayes_learning_index"]),
+    ]
+    owner_groups = pd.factorize(api["owner_key"])[0]
+    owner_n = api.groupby("owner_key")["api_id"].transform("count")
+    within = api.loc[owner_n >= 2].copy().reset_index(drop=True)
+    ids = within[["owner_key", "primary_type"]].astype(str).to_numpy()
+    algorithm = pyhdfe.create(ids, drop_singletons=False)
+    y_dm = algorithm.residualize(within[["ln_flow"]].to_numpy(float)).ravel()
+
+    rows = []
+    key: dict[str, float] = {}
+    for label, focal, mechanism in specifications:
+        variables = list(dict.fromkeys(mechanism + common))
+        x = market_design(api, variables)
+        ols = sm.OLS(api["ln_flow"], x).fit(cov_type="cluster", cov_kwds={"groups": owner_groups})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ppml = sm.GLM(
+                api["subscriptions_count"],
+                x,
+                family=sm.families.Poisson(),
+                offset=np.log(api["age_years"]),
+            ).fit(cov_type="cluster", cov_kwds={"groups": owner_groups})
+
+        x_dm = algorithm.residualize(within[variables].to_numpy(float))
+        keep = x_dm.std(axis=0) > 1e-10
+        names = np.array(variables)[keep]
+        owner_fe = sm.OLS(y_dm, x_dm[:, keep]).fit(
+            cov_type="cluster", cov_kwds={"groups": pd.factorize(within["owner_key"])[0]}
+        )
+        k = int(np.where(names == focal)[0][0])
+        rows.append(
+            {
+                "Learning proxy": label,
+                "Log adoption flow": fmt(
+                    float(ols.params[focal]), float(ols.bse[focal]), float(ols.pvalues[focal])
+                ),
+                "PPML with age exposure": fmt(
+                    float(ppml.params[focal]), float(ppml.bse[focal]), float(ppml.pvalues[focal])
+                ),
+                "Owner and market FE": fmt(
+                    float(owner_fe.params[k]), float(owner_fe.bse[k]), float(owner_fe.pvalues[k])
+                ),
+            }
+        )
+        key[f"{focal}_ols"] = float(ols.params[focal])
+        key[f"{focal}_ols_se"] = float(ols.bse[focal])
+        key[f"{focal}_ppml"] = float(ppml.params[focal])
+        key[f"{focal}_ppml_se"] = float(ppml.bse[focal])
+        key[f"{focal}_fe"] = float(owner_fe.params[k])
+        key[f"{focal}_fe_se"] = float(owner_fe.bse[k])
+
+    table = pd.DataFrame(rows)
+    save_table("trial_learning_identification", table)
+    return table, key
+
+
+def reduced_form_stability(api: pd.DataFrame) -> pd.DataFrame:
+    variables = [
+        "has_free_plan",
+        "ln_price",
+        "trial_learning",
+        "data_scope_index",
+        "disclosure_index",
+        "reliability_index",
+        "versioning_index",
+        "open_best_score",
+        "ln_schema_near",
+        "ln_owner_size",
+    ]
+    rows = []
+    markets = ["All markets", *sorted(api["primary_type"].unique())]
+    for market in markets:
+        sample = api if market == "All markets" else api.loc[api["primary_type"] != market]
+        x = market_design(sample, variables)
+        model = sm.OLS(sample["ln_flow"], x).fit(
+            cov_type="cluster", cov_kwds={"groups": pd.factorize(sample["owner_key"])[0]}
+        )
+        for variable in ["has_free_plan", "data_scope_index", "reliability_index"]:
+            rows.append(
+                {
+                    "Market omitted": market,
+                    "Variable": LABELS[variable],
+                    "Estimate": float(model.params[variable]),
+                    "SE": float(model.bse[variable]),
+                }
+            )
+    frame = pd.DataFrame(rows)
+    save_table("reduced_form_leave_one_market_out", frame)
+
+    fig, axes = plt.subplots(1, 3, figsize=(11.2, 4.2), sharey=True)
+    for ax, variable in zip(axes, ["Free plan", "Data scope", "Reliability"]):
+        sub = frame.loc[frame["Variable"] == variable].reset_index(drop=True)
+        y = np.arange(len(sub))
+        ax.errorbar(sub["Estimate"], y, xerr=1.96 * sub["SE"], fmt="o", color="#15616d", capsize=2)
+        ax.axvline(0, color="#777777", linewidth=0.8)
+        ax.set_title(variable)
+        ax.set_xlabel("Coefficient")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.set_yticks(y)
+        ax.set_yticklabels(sub["Market omitted"] if ax is axes[0] else [])
+    fig.tight_layout()
+    fig.savefig(FIGURES / "reduced_form_leave_one_market_out.png", dpi=220)
+    plt.close(fig)
+    return frame
+
+
+def adoption_specification_curve(api: pd.DataFrame) -> pd.DataFrame:
+    focal_variables = ["has_free_plan", "data_scope_index", "reliability_index"]
+    lean_controls = ["has_free_plan", "ln_price", "data_scope_index", "reliability_index"]
+    full_controls = [
+        "has_free_plan",
+        "ln_price",
+        "trial_learning",
+        "ln_free_quota",
+        "ln_max_paid_quota",
+        "data_scope_index",
+        "data_complexity_index",
+        "disclosure_index",
+        "reliability_index",
+        "versioning_index",
+        "has_restricted_plan",
+        "open_best_score",
+        "ln_schema_near",
+        "ln_owner_size",
+    ]
+    top_cutoff = api["subscriptions_count"].quantile(0.99)
+    samples = {
+        "All APIs": pd.Series(True, index=api.index),
+        "Observed upgrade price": api["prices"] > 0,
+        "Exclude top 1% adoption": api["subscriptions_count"] <= top_cutoff,
+    }
+    outcomes = {"Adoption flow": "ln_flow", "Subscription stock": "ln_subscriptions"}
+    rows = []
+    specification = 0
+    for outcome_label, outcome in outcomes.items():
+        for sample_label, keep in samples.items():
+            for controls_label, controls in [("Lean", lean_controls), ("Full", full_controls)]:
+                specification += 1
+                work = api.loc[keep].copy()
+                x = market_design(work, controls)
+                model = sm.OLS(work[outcome], x).fit(
+                    cov_type="cluster", cov_kwds={"groups": pd.factorize(work["owner_key"])[0]}
+                )
+                for variable in focal_variables:
+                    rows.append(
+                        {
+                            "Specification": specification,
+                            "Outcome": outcome_label,
+                            "Sample": sample_label,
+                            "Controls": controls_label,
+                            "Variable": LABELS[variable],
+                            "Estimate": float(model.params[variable]),
+                            "SE": float(model.bse[variable]),
+                            "N": int(model.nobs),
+                        }
+                    )
+    curve = pd.DataFrame(rows)
+    save_table("adoption_specification_curve", curve)
+    fig, axes = plt.subplots(1, 3, figsize=(11.2, 4.2), sharex=True)
+    for ax, variable in zip(axes, [LABELS[name] for name in focal_variables]):
+        subset = curve[curve["Variable"] == variable].sort_values("Specification")
+        ax.errorbar(
+            subset["Estimate"],
+            subset["Specification"],
+            xerr=1.96 * subset["SE"],
+            fmt="o",
+            color="#15616d",
+            markersize=3,
+            capsize=2,
+        )
+        ax.axvline(0, color="#777777", linewidth=0.8)
+        ax.set(title=variable, xlabel="Coefficient")
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].set_ylabel("Specification")
+    fig.tight_layout()
+    fig.savefig(FIGURES / "adoption_specification_curve.png", dpi=220)
+    plt.close(fig)
+    return curve
 
 
 def plan_versioning() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
@@ -405,6 +753,78 @@ def plan_versioning() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
         "violations": float(np.mean((pairs[:, 0] > 0) & (pairs[:, 1] < 0))),
     }
     return table, monotonic, key
+
+
+def nonrival_supply_calibration() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    plans = pd.read_csv(CRAWL / "data_merged" / "rapidapi_merged_plan_contracts.csv", low_memory=False)
+    for column in ["is_public_plan", "is_hidden_plan", "is_paid_plan", "plan_monthly_price", "max_quota_amount"]:
+        plans[column] = numeric(plans[column])
+    paid = plans.loc[
+        (plans["is_public_plan"] == 1)
+        & (plans["is_hidden_plan"] == 0)
+        & (plans["is_paid_plan"] == 1)
+        & (plans["plan_monthly_price"] > 0)
+        & (plans["max_quota_amount"] > 0)
+    ].copy()
+    paid = paid.loc[
+        (paid["plan_monthly_price"] <= paid["plan_monthly_price"].quantile(0.99))
+        & (paid["max_quota_amount"] <= paid["max_quota_amount"].quantile(0.99))
+    ]
+
+    cloud = pd.read_csv(CRAWL / "data_external" / "cloud_api_costs.csv", low_memory=False)
+    cloud["price_usd"] = numeric(cloud["price_usd"])
+    cloud["begin_range"] = numeric(cloud["begin_range"])
+    request_prices = cloud.loc[
+        cloud["service"].astype(str).eq("AmazonApiGateway")
+        & cloud["unit"].astype(str).str.lower().eq("requests")
+        & cloud["price_usd"].gt(0)
+        & cloud["begin_range"].eq(0),
+        "price_usd",
+    ]
+    cost_per_million = float(request_prices.median() * 1_000_000)
+    paid["gateway_cost_usd"] = paid["max_quota_amount"] * cost_per_million / 1_000_000
+    paid["gateway_cost_share"] = paid["gateway_cost_usd"] / paid["plan_monthly_price"]
+    facts = pd.DataFrame(
+        [
+            {"Calibration statistic": "First-tier AWS API Gateway price per million requests", "Value": cost_per_million},
+            {"Calibration statistic": "Paid public plans with finite positive quota", "Value": len(paid)},
+            {"Calibration statistic": "Median gateway cost share of monthly price", "Value": float(paid["gateway_cost_share"].median())},
+            {"Calibration statistic": "P90 gateway cost share of monthly price", "Value": float(paid["gateway_cost_share"].quantile(0.90))},
+            {"Calibration statistic": "Plans with price above calibrated gateway cost", "Value": float((paid["gateway_cost_share"] <= 1).mean())},
+        ]
+    )
+    save_table("nonrival_supply_calibration", facts)
+
+    path_rows = []
+    for assumed_cost in np.linspace(0, 20, 81):
+        cost_share = paid["max_quota_amount"] * assumed_cost / 1_000_000 / paid["plan_monthly_price"]
+        path_rows.append(
+            {
+                "Gateway service cost per million calls": assumed_cost,
+                "Median variable service cost share": float(cost_share.median()),
+                "P90 variable service cost share": float(cost_share.quantile(0.90)),
+                "Share of plans with nonnegative gross margin": float((cost_share <= 1).mean()),
+            }
+        )
+    path = pd.DataFrame(path_rows)
+    save_table("nonrival_supply_cost_path", path)
+    fig, ax = plt.subplots(figsize=(7.2, 4.3))
+    ax.plot(path.iloc[:, 0], 100 * path["Median variable service cost share"], color="#15616d", label="Median")
+    ax.plot(path.iloc[:, 0], 100 * path["P90 variable service cost share"], color="#a23e48", label="P90")
+    ax.axvline(cost_per_million, color="#777777", linestyle="--", linewidth=1)
+    ax.set(xlabel="Gateway service cost per million calls (USD)", ylabel="Service cost as percent of monthly plan price")
+    ax.legend(frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "nonrival_supply_cost_path.png", dpi=220)
+    plt.close(fig)
+    return facts, path, {
+        "gateway_cost_per_million": cost_per_million,
+        "plan_n": len(paid),
+        "median_cost_share": float(paid["gateway_cost_share"].median()),
+        "p90_cost_share": float(paid["gateway_cost_share"].quantile(0.90)),
+        "positive_margin_share": float((paid["gateway_cost_share"] <= 1).mean()),
+    }
 
 
 def search_analysis(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
@@ -576,7 +996,8 @@ def differentiation_instruments(api: pd.DataFrame) -> tuple[pd.DataFrame, list[s
     return api, names
 
 
-def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float], list[str]]:
+def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float], list[str], pd.DataFrame]:
+    api = api.loc[api["prices"] > 0].copy().reset_index(drop=True)
     api, diff = differentiation_instruments(api)
     contract = [
         "menu_has_hard_limit",
@@ -600,6 +1021,7 @@ def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
         "reliability_index",
         "ln_public_plan_count",
         "versioning_index",
+        "has_restricted_plan",
         "open_best_score",
         "schema_overlap_best",
         "ln_api_age",
@@ -621,7 +1043,22 @@ def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
         "Overage price + number of limits": ["ln_max_overage_price", "mean_limits_n"],
         "All IV groups": diff + owner + contract,
     }
-    rows = []
+    preferred_instruments = ["ln_max_overage_price", "mean_limits_n"]
+    ols_x = pd.concat([exog, api[["prices"]]], axis=1)
+    ols = sm.OLS(api["delta_logit"], ols_x).fit(
+        cov_type="cluster", cov_kwds={"groups": clusters}
+    )
+    rows = [
+        {
+            "Instrument set": "OLS (no excluded instrument)",
+            "Price coefficient": float(ols.params["prices"]),
+            "Clustered SE": float(ols.bse["prices"]),
+            "p-value": float(ols.pvalues["prices"]),
+            "First-stage chi-square": np.nan,
+            "Partial R-squared": np.nan,
+            "Overidentification p-value": np.nan,
+        }
+    ]
     fitted = {}
     for label, instruments in sets.items():
         model = IV2SLS(api["delta_logit"], exog, api[["prices"]], api[instruments]).fit(
@@ -646,13 +1083,29 @@ def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
                 "Overidentification p-value": overid_p,
             }
         )
+    liml = IVLIML(
+        api["delta_logit"], exog, api[["prices"]], api[preferred_instruments]
+    ).fit(cov_type="clustered", clusters=clusters)
+    liml_diag = liml.first_stage.diagnostics.loc["prices"]
+    rows.append(
+        {
+            "Instrument set": "Governance IVs (LIML)",
+            "Price coefficient": float(liml.params["prices"]),
+            "Clustered SE": float(liml.std_errors["prices"]),
+            "p-value": float(liml.pvalues["prices"]),
+            "First-stage chi-square": float(liml_diag["f.stat"]),
+            "Partial R-squared": float(liml_diag["partial.rsquared"]),
+            "Overidentification p-value": np.nan,
+        }
+    )
     table = pd.DataFrame(rows)
     save_table("price_identification", table)
 
     ar_z = "ln_max_overage_price"
-    ar_x = sm.add_constant(pd.concat([exog.drop(columns="constant"), api[[ar_z]]], axis=1), has_constant="add")
-    restriction = np.zeros((1, ar_x.shape[1]))
-    restriction[0, ar_x.columns.get_loc(ar_z)] = 1
+    ar_x = pd.concat([exog, api[preferred_instruments]], axis=1)
+    restriction = np.zeros((len(preferred_instruments), ar_x.shape[1]))
+    for row_index, instrument in enumerate(preferred_instruments):
+        restriction[row_index, ar_x.columns.get_loc(instrument)] = 1
     ar_rows = []
     for candidate in np.linspace(-20, 10, 301):
         model = sm.OLS(api["delta_logit"] - candidate * api["prices"], ar_x).fit(
@@ -716,6 +1169,113 @@ def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
     fig.savefig(FIGURES / "price_definition_sensitivity.png", dpi=220)
     plt.close(fig)
 
+    conley_rows = []
+    for direct_effect in np.linspace(-0.75, 0.75, 121):
+        adjusted_outcome = api["delta_logit"] - direct_effect * api[ar_z]
+        model = IV2SLS(adjusted_outcome, exog, api[["prices"]], api[[ar_z]]).fit(
+            cov_type="clustered", clusters=clusters
+        )
+        conley_rows.append(
+            {
+                "Assumed direct utility effect of overage instrument": direct_effect,
+                "Price coefficient": float(model.params["prices"]),
+                "Clustered SE": float(model.std_errors["prices"]),
+            }
+        )
+    conley = pd.DataFrame(conley_rows)
+    save_table("price_plausibly_exogenous_path", conley)
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    ax.plot(conley.iloc[:, 0], conley["Price coefficient"], color="#15616d", linewidth=2)
+    ax.fill_between(
+        conley.iloc[:, 0],
+        conley["Price coefficient"] - 1.96 * conley["Clustered SE"],
+        conley["Price coefficient"] + 1.96 * conley["Clustered SE"],
+        color="#8ecae6",
+        alpha=0.35,
+    )
+    ax.axhline(0, color="#4a4a4a", linewidth=1)
+    ax.axvline(0, color="#4a4a4a", linewidth=1)
+    ax.set(
+        xlabel="Assumed direct utility effect of the overage instrument",
+        ylabel="Estimated price coefficient",
+    )
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "price_plausibly_exogenous_path.png", dpi=220)
+    plt.close(fig)
+
+    leave_out_rows = []
+    for omitted in ["None", *sorted(api["primary_type"].unique())]:
+        keep = pd.Series(True, index=api.index) if omitted == "None" else api["primary_type"] != omitted
+        exog_sub = exog.loc[keep].copy()
+        varying = exog_sub.std(axis=0) > 1e-12
+        varying.loc["constant"] = True
+        exog_sub = exog_sub.loc[:, varying]
+        combined = np.column_stack([exog_sub.to_numpy(), api.loc[keep, "prices"].to_numpy()])
+        if np.linalg.matrix_rank(combined) < combined.shape[1]:
+            market_columns = [column for column in exog_sub if column.startswith("market_")]
+            if market_columns:
+                exog_sub = exog_sub.drop(columns=market_columns[0])
+        model = IV2SLS(
+            api.loc[keep, "delta_logit"],
+            exog_sub,
+            api.loc[keep, ["prices"]],
+            api.loc[keep, preferred_instruments],
+        ).fit(cov_type="clustered", clusters=clusters[keep])
+        diag = model.first_stage.diagnostics.loc["prices"]
+        leave_out_rows.append(
+            {
+                "Market omitted": omitted,
+                "Price coefficient": float(model.params["prices"]),
+                "Clustered SE": float(model.std_errors["prices"]),
+                "First-stage chi-square": float(diag["f.stat"]),
+            }
+        )
+    leave_out = pd.DataFrame(leave_out_rows)
+    save_table("price_leave_one_market_out", leave_out)
+
+    copy_rows = []
+    for copying in np.linspace(0, 4, 41):
+        true_use = api["q_flow"] * (1 + copying * (0.2 + 0.8 * api["reuse_rank"]))
+        market_total = true_use.groupby(api["primary_type"]).transform("sum")
+        delta_copy = np.log(0.20 * true_use / market_total) - np.log(0.80)
+        model = IV2SLS(delta_copy, exog, api[["prices"]], api[preferred_instruments]).fit(
+            cov_type="clustered", clusters=clusters
+        )
+        copy_rows.append(
+            {
+                "Copying/reuse intensity": copying,
+                "Price coefficient": float(model.params["prices"]),
+                "Clustered SE": float(model.std_errors["prices"]),
+            }
+        )
+    copy_sensitivity = pd.DataFrame(copy_rows)
+    save_table("price_copying_measurement_sensitivity", copy_sensitivity)
+
+    balance_rows = []
+    for instrument in preferred_instruments:
+        z_within = api[instrument] - api.groupby("primary_type")[instrument].transform("mean")
+        for variable in [
+            "data_scope_index",
+            "data_complexity_index",
+            "disclosure_index",
+            "reliability_index",
+            "ln_api_age",
+            "ln_owner_size",
+            "open_best_score",
+            "schema_overlap_best",
+        ]:
+            x_within = api[variable] - api.groupby("primary_type")[variable].transform("mean")
+            balance_rows.append(
+                {
+                    "Instrument": instrument,
+                    "Observed product attribute": variable,
+                    "Within-market correlation": float(z_within.corr(x_within)),
+                }
+            )
+    balance = pd.DataFrame(balance_rows)
+    save_table("price_instrument_balance", balance)
+
     preferred = fitted["Overage price + number of limits"]
     key = {
         "contract_price": float(preferred.params["prices"]),
@@ -730,8 +1290,24 @@ def price_identification(api: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
         "diff_price_se": float(fitted["Differentiation IVs"].std_errors["prices"]),
         "owner_price": float(fitted["Owner other-market IVs"].params["prices"]),
         "owner_price_se": float(fitted["Owner other-market IVs"].std_errors["prices"]),
+        "ols_price": float(ols.params["prices"]),
+        "ols_price_se": float(ols.bse["prices"]),
+        "conley_negative_share": float((conley["Price coefficient"] < 0).mean()),
+        "conley_zero_crossing": float(
+            conley.loc[conley["Price coefficient"].abs().idxmin(), conley.columns[0]]
+        ),
+        "leave_out_negative_share": float((leave_out["Price coefficient"] < 0).mean()),
+        "copy_price_min": float(copy_sensitivity["Price coefficient"].min()),
+        "copy_price_max": float(copy_sensitivity["Price coefficient"].max()),
+        "liml_price": float(liml.params["prices"]),
+        "liml_price_se": float(liml.std_errors["prices"]),
+        "price_sample_n": len(api),
+        "ar_grid_touches_boundary": bool(
+            not accepted.empty
+            and (accepted.min() == ar["Candidate price coefficient"].min() or accepted.max() == ar["Candidate price coefficient"].max())
+        ),
     }
-    return table, sensitivity_frame, key, diff
+    return table, sensitivity_frame, key, diff, api
 
 
 def solve_blp(api: pd.DataFrame, diff: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float], object, pd.DataFrame]:
@@ -742,12 +1318,12 @@ def solve_blp(api: pd.DataFrame, diff: list[str]) -> tuple[pd.DataFrame, pd.Data
     for k, col in enumerate(diff):
         entry[f"demand_instruments{k}"] = entry[col]
     entry_x1 = pyblp.Formulation(
-        "0 + prices + has_free_plan + trial_learning + data_scope_index + data_complexity_index + "
+        "0 + prices + has_free_plan + bayes_learning_index + data_scope_index + data_complexity_index + "
         "disclosure_index + reliability_index + ln_public_plan_count + versioning_index + "
-        "open_score_z + schema_overlap_z + ln_api_age",
+        "has_restricted_plan + open_score_z + schema_overlap_z + ln_api_age",
         absorb="C(market_ids)",
     )
-    entry_x2 = pyblp.Formulation("0 + prices + data_scope_index + trial_learning")
+    entry_x2 = pyblp.Formulation("0 + prices + data_scope_index + bayes_learning_index")
     entry_problem = pyblp.Problem(
         (entry_x1, entry_x2),
         entry,
@@ -758,15 +1334,17 @@ def solve_blp(api: pd.DataFrame, diff: list[str]) -> tuple[pd.DataFrame, pd.Data
         method="1s",
         optimization=pyblp.Optimization("l-bfgs-b", {"gtol": 1e-4, "maxiter": 60}),
         sigma_bounds=(np.zeros((3, 3)), np.full((3, 3), np.inf)),
+        se_type="clustered",
     )
 
     preferred = api.copy()
     for k, col in enumerate(["ln_max_overage_price", "mean_limits_n"]):
         preferred[f"demand_instruments{k}"] = zscore(preferred[col])
     preferred_x1 = pyblp.Formulation(
-        "0 + prices + has_free_plan + trial_learning + ln_free_quota + ln_max_paid_quota + "
+        "0 + prices + has_free_plan + bayes_learning_index + ln_free_quota + ln_max_paid_quota + "
         "data_scope_index + data_complexity_index + disclosure_index + reliability_index + "
-        "ln_public_plan_count + versioning_index + open_score_z + schema_overlap_z + ln_api_age + menu_has_overage",
+        "ln_public_plan_count + versioning_index + has_restricted_plan + open_score_z + schema_overlap_z + "
+        "ln_api_age + menu_has_overage",
         absorb="C(market_ids)",
     )
     preferred_x2 = pyblp.Formulation("0 + prices")
@@ -780,37 +1358,43 @@ def solve_blp(api: pd.DataFrame, diff: list[str]) -> tuple[pd.DataFrame, pd.Data
         method="2s",
         optimization=pyblp.Optimization("l-bfgs-b", {"gtol": 1e-5, "maxiter": 100}),
         sigma_bounds=(np.zeros((1, 1)), np.full((1, 1), np.inf)),
+        se_type="clustered",
     )
 
-    paid_only = api.loc[(api["has_free_plan"] == 0) & (api["prices"] > 0)].copy().reset_index(drop=True)
-    paid_only["market_size"] = paid_only.groupby("primary_type")["q_flow"].transform("sum") / 0.20
-    paid_only["shares"] = paid_only["q_flow"] / paid_only["market_size"]
-    paid_only["delta_logit"] = np.log(paid_only["shares"]) - np.log(0.80)
-    for k, col in enumerate(["ln_max_overage_price", "mean_limits_n"]):
-        paid_only[f"demand_instruments{k}"] = zscore(paid_only[col])
-    paid_x1 = pyblp.Formulation(
-        "0 + prices + ln_max_paid_quota + data_scope_index + data_complexity_index + disclosure_index + "
-        "reliability_index + ln_public_plan_count + versioning_index + open_score_z + schema_overlap_z + "
-        "ln_api_age + menu_has_overage",
-        absorb="C(market_ids)",
-    )
-    paid_problem = pyblp.Problem(
-        (paid_x1, pyblp.Formulation("0 + prices")),
-        paid_only,
+    classified = preferred.loc[preferred["primary_type"] != "other"].copy().reset_index(drop=True)
+    classified_problem = pyblp.Problem(
+        (preferred_x1, preferred_x2),
+        classified,
         integration=pyblp.Integration("monte_carlo", size=20, specification_options={"seed": 123}),
     )
-    paid_result = paid_problem.solve(
+    classified_result = classified_problem.solve(
         sigma=np.array([[0.5]]),
         method="2s",
         optimization=pyblp.Optimization("l-bfgs-b", {"gtol": 1e-5, "maxiter": 100}),
         sigma_bounds=(np.zeros((1, 1)), np.full((1, 1), np.inf)),
+        se_type="clustered",
+    )
+
+    paid_only = api.loc[(api["has_free_plan"] == 0) & (api["prices"] > 0)].copy().reset_index(drop=True)
+    paid_only["demand_instruments0"] = zscore(paid_only["ln_max_overage_price"])
+    paid_x1 = pyblp.Formulation(
+        "0 + prices + ln_max_paid_quota + data_scope_index + data_complexity_index + disclosure_index + "
+        "reliability_index + ln_public_plan_count + versioning_index + open_score_z + "
+        "schema_overlap_z + ln_api_age + menu_has_overage",
+        absorb="C(market_ids)",
+    )
+    paid_problem = pyblp.Problem(paid_x1, paid_only)
+    paid_result = paid_problem.solve(
+        method="2s",
+        se_type="clustered",
     )
 
     rows = []
     for specification, result in [
         ("Entry-price diagnostic", entry_result),
         ("Full-market upgrade-price BLP", preferred_result),
-        ("Paid-entry-only BLP", paid_result),
+        ("Classified-use-case BLP", classified_result),
+        ("Paid-entry-only IV logit", paid_result),
     ]:
         for label, beta, se in zip(result.beta_labels, result.beta.ravel(), result.beta_se.ravel()):
             rows.append(
@@ -853,13 +1437,22 @@ def solve_blp(api: pd.DataFrame, diff: list[str]) -> tuple[pd.DataFrame, pd.Data
                 "Random price SD": float(preferred_result.sigma[0, 0]),
             },
             {
-                "Specification": "Paid-entry-only BLP",
+                "Specification": "Paid-entry-only IV logit",
                 "Products": paid_problem.N,
                 "Markets": paid_problem.T,
                 "Converged": bool(paid_result.converged),
                 "Objective": float(paid_result.objective),
                 "Price coefficient": float(paid_result.beta[0, 0]),
-                "Random price SD": float(paid_result.sigma[0, 0]),
+                "Random price SD": np.nan,
+            },
+            {
+                "Specification": "Classified-use-case BLP",
+                "Products": classified_problem.N,
+                "Markets": classified_problem.T,
+                "Converged": bool(classified_result.converged),
+                "Objective": float(classified_result.objective),
+                "Price coefficient": float(classified_result.beta[0, 0]),
+                "Random price SD": float(classified_result.sigma[0, 0]),
             },
         ]
     )
@@ -874,8 +1467,15 @@ def solve_blp(api: pd.DataFrame, diff: list[str]) -> tuple[pd.DataFrame, pd.Data
         "price_sigma_se": float(preferred_result.sigma_se[0, 0]),
         "paid_only_price": float(paid_result.beta[0, 0]),
         "paid_only_price_se": float(paid_result.beta_se[0, 0]),
-        "paid_only_sigma": float(paid_result.sigma[0, 0]),
-        "paid_only_sigma_se": float(paid_result.sigma_se[0, 0]),
+        "paid_only_sigma": np.nan,
+        "paid_only_sigma_se": np.nan,
+        "classified_price": float(classified_result.beta[0, 0]),
+        "classified_price_se": float(classified_result.beta_se[0, 0]),
+        "classified_sigma": float(classified_result.sigma[0, 0]),
+        "classified_sigma_se": float(classified_result.sigma_se[0, 0]),
+        "full_products": int(preferred_problem.N),
+        "classified_products": int(classified_problem.N),
+        "paid_only_products": int(paid_problem.N),
         **{f"beta_{key}": value for key, value in beta.items()},
     }
     return estimates, diagnostics, key, preferred_result, preferred
@@ -926,13 +1526,13 @@ def counterfactuals(api: pd.DataFrame, blp_key: dict[str, float], price_key: dic
     save_table("counterfactual_price_path", price_path)
 
     beta_free = blp_key.get("beta_has_free_plan", 0.0)
-    beta_trial = blp_key.get("beta_trial_learning", 0.0)
+    beta_trial = blp_key.get("beta_bayes_learning_index", 0.0)
     baseline = simulate(api, zero, base_price, beta_point)
     trial_rows = []
     for scale in np.linspace(0, 2, 81):
         shock = (scale - 1) * (
             beta_free * api["has_free_plan"].to_numpy(float)
-            + beta_trial * api["trial_learning"].to_numpy(float)
+            + beta_trial * api["bayes_learning_index"].to_numpy(float)
         )
         outcome = simulate(api, shock, base_price, beta_point)
         trial_rows.append(
@@ -991,6 +1591,27 @@ def counterfactuals(api: pd.DataFrame, blp_key: dict[str, float], price_key: dic
     conversion_path = pd.DataFrame(conversion_rows)
     save_table("counterfactual_conversion_path", conversion_path)
 
+    beta_governance = blp_key.get("beta_menu_has_overage", 0.0)
+    beta_restriction = blp_key.get("beta_has_restricted_plan", 0.0)
+    governance_utility = (
+        beta_governance * api["menu_has_overage"].to_numpy(float)
+        + beta_restriction * api["has_restricted_plan"].to_numpy(float)
+    )
+    governance_rows = []
+    for scale in np.linspace(0, 2, 81):
+        shock = (scale - 1) * governance_utility
+        outcome = simulate(api, shock, base_price, beta_point)
+        governance_rows.append(
+            {
+                "Access-governance utility scale": scale,
+                "Adoption change": pct(outcome["adoption"], baseline["adoption"]),
+                "Revenue change": pct(outcome["revenue"], baseline["revenue"]),
+                "Consumer surplus change": pct(outcome["consumer_surplus"], baseline["consumer_surplus"]),
+            }
+        )
+    governance_path = pd.DataFrame(governance_rows)
+    save_table("counterfactual_governance_path", governance_path)
+
     reuse_score = zscore(api["data_scope_index"] + api["schema_overlap_z"] + api["any_github"])
     reuse_rank = reuse_score.rank(pct=True).to_numpy(float)
     observed_use = float(api["q_flow"].sum())
@@ -1007,6 +1628,29 @@ def counterfactuals(api: pd.DataFrame, blp_key: dict[str, float], price_key: dic
         )
     copy_path = pd.DataFrame(copy_rows)
     save_table("counterfactual_copying_path", copy_path)
+
+    outside_rows = []
+    for inside_share in np.linspace(0.05, 0.50, 46):
+        scaled = api.copy()
+        scaled["market_size"] = scaled.groupby("primary_type")["q_flow"].transform("sum") / inside_share
+        scaled["shares"] = scaled["q_flow"] / scaled["market_size"]
+        scaled["delta_logit"] = np.log(scaled["shares"]) - np.log(1 - inside_share)
+        base_scaled = simulate(scaled, zero, base_price, beta_point)
+        price_shock = beta_point * (scaled["prices"].to_numpy(float) * 1.10 - scaled["prices"].to_numpy(float))
+        higher_price = simulate(scaled, price_shock, base_price * 1.10, beta_point)
+        outside_rows.append(
+            {
+                "Assumed aggregate inside share": inside_share,
+                "Adoption change from 10 percent price increase": pct(
+                    higher_price["adoption"], base_scaled["adoption"]
+                ),
+                "Revenue change from 10 percent price increase": pct(
+                    higher_price["revenue"], base_scaled["revenue"]
+                ),
+            }
+        )
+    outside_path = pd.DataFrame(outside_rows)
+    save_table("counterfactual_market_size_path", outside_path)
 
     fig, ax = plt.subplots(figsize=(7.2, 4.4))
     ax.plot(price_path["Price multiplier"], price_path["Adoption change: BLP point"], color="#15616d", linewidth=2, label="Adoption")
@@ -1044,6 +1688,26 @@ def counterfactuals(api: pd.DataFrame, blp_key: dict[str, float], price_key: dic
     fig.savefig(FIGURES / "counterfactual_mechanism_paths.png", dpi=220)
     plt.close(fig)
 
+    fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.8))
+    axes[0].plot(
+        conversion_path["Free-to-paid conversion rate"],
+        conversion_path["Revenue change relative to 25 percent"],
+        color="#15616d",
+    )
+    axes[0].axvline(0.25, color="#777777", linewidth=0.8)
+    axes[0].set(title="Free-to-paid conversion", xlabel="Conversion rate", ylabel="Revenue change (%)")
+    axes[1].plot(governance_path.iloc[:, 0], governance_path["Adoption change"], color="#2a9d8f")
+    axes[1].axvline(1, color="#777777", linewidth=0.8)
+    axes[1].set(title="Access governance", xlabel="Utility scale", ylabel="Adoption change (%)")
+    axes[2].plot(outside_path.iloc[:, 0], outside_path.iloc[:, 1], color="#a23e48")
+    axes[2].set(title="Market-size normalization", xlabel="Inside share", ylabel="Price +10% adoption change")
+    for ax in axes:
+        ax.axhline(0, color="#777777", linewidth=0.8)
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "counterfactual_monetization_paths.png", dpi=220)
+    plt.close(fig)
+
     def nearest(frame: pd.DataFrame, column: str, value: float) -> pd.Series:
         return frame.iloc[(frame[column] - value).abs().argmin()]
 
@@ -1052,13 +1716,15 @@ def counterfactuals(api: pd.DataFrame, blp_key: dict[str, float], price_key: dic
     disclosure_one = nearest(disclosure_path, "Disclosure lift (SD)", 1.0)
     open_one = nearest(open_path, "Open-substitute salience lift (SD)", 1.0)
     copy_one = nearest(copy_path, "Copying/reuse intensity", 1.0)
+    governance_zero = nearest(governance_path, "Access-governance utility scale", 0.0)
     summary = pd.DataFrame(
         [
             {"Counterfactual": "Paid upgrade prices +10%", "Adoption change": price_110["Adoption change: BLP point"], "Revenue/use change": price_110["Revenue change: BLP point"]},
-            {"Counterfactual": "Remove estimated trial-information value", "Adoption change": trial_zero["Adoption change"], "Revenue/use change": trial_zero["Revenue change"]},
+            {"Counterfactual": "Remove conditional free-access and learning utility", "Adoption change": trial_zero["Adoption change"], "Revenue/use change": trial_zero["Revenue change"]},
             {"Counterfactual": "Low-disclosure APIs improve disclosure by 1 SD", "Adoption change": disclosure_one["Adoption change"], "Revenue/use change": disclosure_one["Revenue change"]},
             {"Counterfactual": "Open-substitute salience rises by 1 SD", "Adoption change": open_one["Adoption change"], "Revenue/use change": open_one["Revenue change"]},
             {"Counterfactual": "Copying/reuse intensity equals 1", "Adoption change": np.nan, "Revenue/use change": copy_one["Downstream use above platform subscriptions"]},
+            {"Counterfactual": "Remove conditional access-governance utility", "Adoption change": governance_zero["Adoption change"], "Revenue/use change": governance_zero["Revenue change"]},
         ]
     )
     save_table("counterfactual_summary", summary)
@@ -1071,15 +1737,26 @@ def counterfactuals(api: pd.DataFrame, blp_key: dict[str, float], price_key: dic
         "disclosure_lift": float(disclosure_one["Adoption change"]),
         "open_lift": float(open_one["Adoption change"]),
         "copy_one": float(copy_one["Downstream use above platform subscriptions"]),
+        "governance_remove": float(governance_zero["Adoption change"]),
+        "outside_price_min": float(outside_path.iloc[:, 1].min()),
+        "outside_price_max": float(outside_path.iloc[:, 1].max()),
     }
 
 
 def write_report(
     audit: pd.DataFrame,
+    fundamental_summary: pd.DataFrame,
+    markets: pd.DataFrame,
+    fundamental_key: dict[str, float],
+    contract: pd.DataFrame,
     adoption: pd.DataFrame,
     adoption_key: dict[str, float],
+    trial: pd.DataFrame,
+    trial_key: dict[str, float],
     plan: pd.DataFrame,
     plan_key: dict[str, float],
+    supply: pd.DataFrame,
+    supply_key: dict[str, float],
     search_ranking: pd.DataFrame,
     search_iv: pd.DataFrame,
     search_key: dict[str, float],
@@ -1108,7 +1785,13 @@ def write_report(
 
 {markdown_table(audit)}
 
-The empirical unit changes with the mechanism. Adoption and differentiated-product demand use 7,296 APIs. Contract versioning uses 24,889 plan records and identifies the price-quota schedule from variation within an API. Platform allocation uses 237,413 search-result observations and compares products inside the same query and sort. Substitution is measured with 364,284 schema-overlap pairs and external open-data matches. Public GitHub repositories provide an outcome outside RapidAPI with which to validate whether platform subscriptions capture broader adoption.
+{markdown_table(fundamental_summary)}
+
+{markdown_table(markets)}
+
+{markdown_table(contract[["Contract fact", "Percent", "Denominator"]])}
+
+The empirical unit changes with the mechanism. The product universe contains {fundamental_key['api_count']:,.0f} APIs supplied by {fundamental_key['owner_count']:,.0f} owners in {fundamental_key['market_count']:,.0f} use-case markets. {100 * fundamental_key['free_share']:.1f} percent offer a public free plan, while {100 * fundamental_key['positive_price_share']:.1f} percent expose a positive paid-upgrade price. The median positive upgrade price is USD {fundamental_key['median_positive_price']:.2f} per month. Contract versioning uses plan records and identifies the price-quota schedule from variation within an API. Platform allocation compares products inside the same query and sort. Schema-overlap pairs and external open-data matches measure substitution. Public GitHub repositories provide an outcome outside RapidAPI with which to validate whether platform subscriptions capture broader adoption.
 
 Platform subscriptions are cumulative. The main adoption outcome converts the stock into an exposure-adjusted flow,
 
@@ -1133,6 +1816,10 @@ where $F_j$ denotes a free plan, $U_j$ is ex ante uncertainty, and $\mu_m$ is a 
 The three columns do not support a single mechanical interpretation of free access. In the PPML specification, the free-plan coefficient is {adoption_key['ppml_free']:.3f} with a clustered standard error of {adoption_key['ppml_free_se']:.3f}; it is imprecise once the highly skewed count outcome and owner-level dependence are respected. Within multi-product owners, the coefficient is {adoption_key['owner_fe_free']:.3f} ({adoption_key['owner_fe_free_se']:.3f}). This comparison removes persistent seller heterogeneity, but plan choice can still respond to product-specific demand. The result therefore establishes a strong within-seller association, not a randomized free-trial effect.
 
 Data scope and reliability are more stable. Their owner-fixed-effect coefficients are {adoption_key['owner_fe_scope']:.3f} and {adoption_key['owner_fe_reliability']:.3f}. Broader data increase the set of potential downstream tasks, while reliability determines whether the data can be embedded in a production workflow. The uncertainty interaction is not stable enough to claim that the cross section alone identifies Bayesian learning from trial use. A dynamic design would require plan changes followed by subscription flows.
+
+{markdown_table(trial)}
+
+The trial table maps the theory into progressively richer proxies. The first row uses a linear free-by-uncertainty interaction. The second lets free quota, disclosure, and reliability determine signal precision. The third computes the reduction in posterior variance implied by a normal-signal experiment. Its owner-fixed-effect coefficient is {trial_key['bayes_learning_index_fe']:.3f} ({trial_key['bayes_learning_index_fe_se']:.3f}). These proxies clarify what the learning mechanism requires, but they remain functions of seller-chosen contracts and public information. They discipline the structural decomposition without turning a static cross section into a trial experiment.
 
 # Versioning
 
@@ -1182,13 +1869,19 @@ The instrument comparison is itself a result. Differentiation IVs produce a pric
 
 {markdown_table(diagnostics)}
 
-The entry-price diagnostic sets price to zero whenever a free plan exists. It produces a price coefficient of {blp_key['entry_price']:.3f} ({blp_key['entry_price_se']:.3f}), confirming that entry price is inseparable from endogenous free-plan choice. The full-market specification uses the posted paid-upgrade price and conditions on the free tier, quotas, plan count, versioning, and observed quality. Its mean price coefficient is {blp_key['preferred_price']:.3f} ({blp_key['preferred_price_se']:.3f}). In the cleaner sample of 766 APIs with no free entry tier, the price coefficient is {blp_key['paid_only_price']:.3f} ({blp_key['paid_only_price_se']:.3f}). The paid-entry estimate has the expected sign but is imprecise, showing that the full-market coefficient partly relies on how free APIs expose buyers to later upgrade prices. The estimated full-market random-price standard deviation is {blp_key['price_sigma']:.3f} with a standard error of {blp_key['price_sigma_se']:.3f}; the paid-only random coefficient also collapses to zero. Thus the data identify a conditional negative mean response under governance instruments, but do not identify random-coefficient dispersion. Forcing a large random coefficient would manufacture substitution patterns that the aggregate cross section does not contain.
+The entry-price diagnostic sets price to zero whenever a free plan exists. It produces a price coefficient of {blp_key['entry_price']:.3f} ({blp_key['entry_price_se']:.3f}), confirming that entry price is inseparable from endogenous free-plan choice. The full-market specification uses {blp_key['full_products']:,} products with an observed positive paid-upgrade price and conditions on the free tier, quotas, plan count, versioning, and observed quality. Its mean price coefficient is {blp_key['preferred_price']:.3f} ({blp_key['preferred_price_se']:.3f}). Excluding the broad residual use-case market leaves {blp_key['classified_products']:,} products and produces {blp_key['classified_price']:.3f} ({blp_key['classified_price_se']:.3f}). In the cleaner sample of {blp_key['paid_only_products']:,} APIs with no free entry tier, a homogeneous IV logit produces {blp_key['paid_only_price']:.3f} ({blp_key['paid_only_price_se']:.3f}); this smaller sample has too few independent moments to estimate another random coefficient. The paid-entry estimate shows how much the full-market coefficient relies on free APIs exposing buyers to later upgrade prices. The estimated full-market random-price standard deviation is {blp_key['price_sigma']:.3f} with a standard error of {blp_key['price_sigma_se']:.3f}. The classified-market random coefficient provides a market-definition diagnostic. If it and the full-market coefficient remain on the boundary, the aggregate cross section identifies a homogeneous-logit mean response rather than random-coefficient dispersion.
 
 # Supply
 
-The platform reports plan prices and quotas but not plan-specific take-up. A conventional multiproduct supply inversion would require the share of subscribers choosing each paid plan. Using total API subscriptions as paid-plan quantity would overstate revenue for the 6,525 APIs with free access and would generate spurious markups. The supply evidence therefore comes from the within-API menu schedule rather than from a claimed point estimate of marginal cost.
+The platform reports plan prices and quotas but not plan-specific take-up. A conventional multiproduct supply inversion would require the share of subscribers choosing each paid plan. Using total API subscriptions as paid-plan quantity would overstate revenue for approximately {fundamental_key['api_count'] * fundamental_key['free_share']:,.0f} APIs with free access and would generate spurious markups. The supply evidence therefore comes from the within-API menu schedule rather than from a claimed point estimate of marginal cost.
 
 This distinction reflects the economics of data. Replication is nearly costless, but reliable access is not: rate limiting, monitoring, cleaning, compute, legal compliance, and service guarantees create usage-governance costs. The plan regression identifies how sellers price the boundary of access. It does not separately identify accounting marginal cost and information rent.
+
+{markdown_table(supply)}
+
+The public cloud calibration prices only the gateway service needed to deliver calls. The first-tier benchmark is USD {supply_key['gateway_cost_per_million']:.2f} per million requests. At that benchmark, the median implied gateway cost is {100 * supply_key['median_cost_share']:.3f} percent of the plan fee and the P90 is {100 * supply_key['p90_cost_share']:.3f} percent. This small delivery component is consistent with nonrival replication, while leaving data acquisition, cleaning, compute-intensive responses, support, and legal risk outside the calibration. The continuous cost path therefore measures how far service costs can move before posted plan prices cease to cover this narrow variable-cost component; it is not a marginal-cost estimate.
+
+![Service-cost calibration](../figures/nonrival_supply_cost_path.png)
 
 # Counterfactuals
 
@@ -1197,6 +1890,8 @@ This distinction reflects the economics of data. Replication is nearly costless,
 ![Price counterfactual](../figures/counterfactual_price_path.png)
 
 ![Mechanism counterfactuals](../figures/counterfactual_mechanism_paths.png)
+
+![Monetization counterfactuals](../figures/counterfactual_monetization_paths.png)
 
 All counterfactuals are continuous paths. A 10 percent increase in paid-upgrade prices changes adoption by {counterfactual_key['price10_adoption']:.2f} percent at the BLP point estimate. Carrying the AR set through demand gives a range from {counterfactual_key['price10_adoption_low']:.2f} to {counterfactual_key['price10_adoption_high']:.2f} percent. The corresponding seller-revenue proxy changes by {counterfactual_key['price10_revenue']:.2f} percent under a 25 percent free-to-paid conversion calibration. The price graph makes the identifying uncertainty visible rather than hiding it in a single elasticity.
 
@@ -1222,29 +1917,47 @@ The evidence is strongest for menu versioning and quantity discounts, followed b
 
 
 def main() -> None:
+    global SNAPSHOT_DATE
     parser = argparse.ArgumentParser(description="Run the full static RapidAPI reduced-form and BLP analysis.")
     parser.add_argument("--skip-blp", action="store_true", help="Run reduced forms only.")
+    parser.add_argument("--snapshot-date", default=None, help="ISO date used to construct API age.")
     args = parser.parse_args()
+    if args.snapshot_date:
+        SNAPSHOT_DATE = pd.Timestamp(args.snapshot_date, tz="UTC")
     ensure_dirs()
     api = load_api_data()
     api.to_csv(DATA / "full_api_analysis_panel.csv", index=False)
     audit = sample_audit(api)
+    fundamental_summary, markets, fundamental_key = fundamental_analysis(api)
+    contract, contract_key = contract_descriptives(api)
     adoption, adoption_key = adoption_reduced_form(api)
+    trial, trial_key = trial_learning_reduced_form(api)
+    reduced_form_stability(api)
+    adoption_specification_curve(api)
     plan, _, plan_key = plan_versioning()
+    supply, _, supply_key = nonrival_supply_calibration()
     search_ranking, search_iv, search_key = search_analysis(api)
     external, external_key = external_diffusion(api)
-    price, _, price_key, diff = price_identification(api)
+    price, _, price_key, diff, price_sample = price_identification(api)
     if args.skip_blp:
         print("Reduced-form analysis complete. BLP was skipped.")
         return
-    blp, diagnostics, blp_key, _, preferred_data = solve_blp(api, diff)
+    blp, diagnostics, blp_key, _, preferred_data = solve_blp(price_sample, diff)
     counterfactual, counterfactual_key = counterfactuals(preferred_data, blp_key, price_key)
     report = write_report(
         audit,
+        fundamental_summary,
+        markets,
+        fundamental_key,
+        contract,
         adoption,
         adoption_key,
+        trial,
+        trial_key,
         plan,
         plan_key,
+        supply,
+        supply_key,
         search_ranking,
         search_iv,
         search_key,
@@ -1257,6 +1970,22 @@ def main() -> None:
         blp_key,
         counterfactual,
         counterfactual_key,
+    )
+    summary = {
+        "fundamentals": fundamental_key,
+        "contract": contract_key,
+        "adoption": adoption_key,
+        "trial": trial_key,
+        "plan": plan_key,
+        "supply": supply_key,
+        "search": search_key,
+        "external": external_key,
+        "price": price_key,
+        "blp": blp_key,
+        "counterfactual": counterfactual_key,
+    }
+    (OUT / "analysis_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"Full analysis complete: {report}")
 

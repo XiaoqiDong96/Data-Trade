@@ -12,11 +12,15 @@ import argparse
 import csv
 import json
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_consolidated_tables as consolidated  # noqa: E402
 
 
 MERGED_TABLES = [
@@ -163,6 +167,35 @@ def filter_new(df: pd.DataFrame, api_ids: set[str]) -> pd.DataFrame:
     return df[df["api_id"].astype(str).isin(api_ids)].copy()
 
 
+def build_consolidated_delta_sources(work_root: Path, run_dir: Path) -> dict[str, pd.DataFrame]:
+    """Build run-scoped tables with the same source joins as the full merge."""
+    pseudo_root = run_dir / "_strict_consolidated_root"
+    pseudo_out = run_dir / "_strict_consolidated_tables"
+    if pseudo_root.exists():
+        shutil.rmtree(pseudo_root)
+    if pseudo_out.exists():
+        shutil.rmtree(pseudo_out)
+    (pseudo_root / "rapidapi_crawl").mkdir(parents=True, exist_ok=True)
+    (pseudo_root / "rapidapi_io_static").mkdir(parents=True, exist_ok=True)
+    data_link = pseudo_root / "rapidapi_crawl" / "data"
+    model_link = pseudo_root / "rapidapi_io_static" / "data"
+    data_link.symlink_to(work_root.resolve() / "data", target_is_directory=True)
+    model_link.symlink_to(work_root.resolve() / "data", target_is_directory=True)
+    pseudo_out.mkdir(parents=True, exist_ok=True)
+
+    outputs: dict[str, pd.DataFrame] = {}
+    for builder in [
+        consolidated.build_api_master,
+        consolidated.build_plan_contracts,
+        consolidated.build_endpoint_schema,
+        consolidated.build_search_exposure,
+        consolidated.build_marketplace_listings,
+    ]:
+        path, _ = builder(pseudo_root, pseudo_out)
+        outputs[path.name] = read_csv(path)
+    return outputs
+
+
 def build(args: argparse.Namespace) -> None:
     work_root = Path(args.work_root)
     data_dir = work_root / "data"
@@ -177,36 +210,18 @@ def build(args: argparse.Namespace) -> None:
     candidate_ids = set(unique_nonempty(candidate.get("api_id", pd.Series(dtype=str))))
     new_ids = valid_ids or candidate_ids
 
-    api_source = first_existing(
-        [
-            data_dir / "rapidapi_static_Data_api_model_panel_plus.csv",
-            data_dir / "rapidapi_static_Data_api_model_panel.csv",
-            data_dir / "rapidapi_static_Data_api_enriched.csv",
-            data_dir / "rapidapi_details_Data_apis.csv",
-        ]
-    )
-    plan_source = first_existing(
-        [
-            data_dir / "rapidapi_static_Data_plan_enriched.csv",
-            data_dir / "rapidapi_panel_Data_plan.csv",
-            data_dir / "rapidapi_details_Data_billing_plans.csv",
-        ]
-    )
-    endpoint_source = first_existing(
-        [
-            data_dir / "rapidapi_static_Data_endpoints.csv",
-        ]
-    )
-    exposure_source = read_csv(data_dir / "rapidapi_search_Data_exposure_panel.csv")
-    listing_source = read_csv(run_dir / "rapidapi_weekly_new_marketplace_listings_raw.csv")
+    source_outputs = build_consolidated_delta_sources(work_root, run_dir)
+    listing_source = source_outputs.get("rapidapi_merged_marketplace_listings.csv", pd.DataFrame())
+    if listing_source.empty:
+        listing_source = read_csv(run_dir / "rapidapi_weekly_new_marketplace_listings_raw.csv")
     if listing_source.empty:
         listing_source = candidate
 
     outputs = {
-        "rapidapi_merged_api_master.csv": filter_new(api_source, new_ids),
-        "rapidapi_merged_plan_contracts.csv": filter_new(plan_source, new_ids),
-        "rapidapi_merged_endpoint_schema.csv": filter_new(endpoint_source, new_ids),
-        "rapidapi_merged_search_exposure.csv": filter_new(exposure_source, new_ids),
+        "rapidapi_merged_api_master.csv": filter_new(source_outputs.get("rapidapi_merged_api_master.csv", pd.DataFrame()), new_ids),
+        "rapidapi_merged_plan_contracts.csv": filter_new(source_outputs.get("rapidapi_merged_plan_contracts.csv", pd.DataFrame()), new_ids),
+        "rapidapi_merged_endpoint_schema.csv": filter_new(source_outputs.get("rapidapi_merged_endpoint_schema.csv", pd.DataFrame()), new_ids),
+        "rapidapi_merged_search_exposure.csv": filter_new(source_outputs.get("rapidapi_merged_search_exposure.csv", pd.DataFrame()), new_ids),
         "rapidapi_merged_marketplace_listings.csv": filter_new(listing_source, new_ids),
     }
 

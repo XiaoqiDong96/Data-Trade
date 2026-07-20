@@ -55,8 +55,21 @@ function collectionParentID(collection) {
   return collection.parentID || null;
 }
 
+function allCollections() {
+  const found = [];
+  function visit(collection) {
+    if (!collection || collection.deleted) return;
+    found.push(collection);
+    for (const child of collection.getChildCollections(false, true)) visit(child);
+  }
+  for (const rootCollection of Zotero.Collections.getByLibrary(libraryID)) {
+    visit(rootCollection);
+  }
+  return found;
+}
+
 async function ensureCollection(name, parentID = null) {
-  const existing = Zotero.Collections.getByLibrary(libraryID).find(
+  const existing = allCollections().find(
     (collection) =>
       collection.name === name &&
       collectionParentID(collection) === (parentID || null),
@@ -376,6 +389,12 @@ for (const item of downloadQueue) {
 const missingItemIDs = [];
 for (const item of regularItems) {
   if (!(await hasLocalPDF(item))) missingItemIDs.push(item.id);
+}
+const staleMissingItemIDs = collections.missing.getChildItems(true, true);
+if (staleMissingItemIDs.length) {
+  await Zotero.DB.executeTransaction(async () => {
+    await collections.missing.removeItems(staleMissingItemIDs);
+  });
 }
 await addToCollection(collections.missing, missingItemIDs);
 report.missingFullText = missingItemIDs.length;
